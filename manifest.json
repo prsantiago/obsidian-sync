@@ -1,0 +1,10 @@
+{
+  "id": "obsidian-gdrive-sync",
+  "name": "Google Drive Sync",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Automatic two-way vault sync directly with Google Drive (cross-platform, iOS & desktop).",
+  "author": "prsantiago",
+  "authorUrl": "https://github.com/prsantiago/obsidian-sync",
+  "isDesktopOnly": false
+}
