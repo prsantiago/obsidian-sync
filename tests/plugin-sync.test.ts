@@ -937,4 +937,228 @@ describe("Google Drive Sync Plugin (Primary Seam)", () => {
       expect(http.multipartUploadCount).toBe(0);
     });
   });
+
+  describe("Two-way deletions & delete-beats-edit", () => {
+    beforeEach(async () => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      plugin.dispose();
+      vi.useRealTimers();
+    });
+
+    it("moves a locally deleted file to Google Drive Trash (trashed: true) and removes it from Sync Index", async () => {
+      http.seedFile({
+        id: "drive-note-1",
+        name: "Note.md",
+        parentId: "root-folder-1",
+        content: "hello",
+        md5Checksum: "md5-note-1",
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      expect(await vault.exists("Note.md")).toBe(true);
+      now += 3_000;
+
+      await vault.remove("Note.md");
+      plugin.onVaultDelete("Note.md");
+
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(http.getItem("drive-note-1")?.trashed).toBe(true);
+      expect(http.findItemByName("Note.md", "root-folder-1")).toBeUndefined();
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.syncIndex["Note.md"]).toBeUndefined();
+    });
+
+    it("moves a locally deleted folder to Google Drive Trash (trashed: true) and removes the entire subtree from Sync Index", async () => {
+      http.seedFolder("dir-proj", "Projects", "root-folder-1");
+      http.seedFolder("dir-sub", "Sub", "dir-proj");
+      http.seedFile({ id: "f-todo", name: "Todo.md", parentId: "dir-proj", content: "todo" });
+      http.seedFile({ id: "f-plan", name: "Plan.md", parentId: "dir-sub", content: "plan" });
+
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      now += 3_000;
+
+      await vault.rmdir("Projects", true);
+      plugin.onVaultDelete("Projects/Sub/Plan.md");
+      plugin.onVaultDelete("Projects/Sub");
+      plugin.onVaultDelete("Projects/Todo.md");
+      plugin.onVaultDelete("Projects");
+
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(http.getItem("dir-proj")?.trashed).toBe(true);
+      expect(http.findItemByName("Projects", "root-folder-1")).toBeUndefined();
+
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.syncIndex["Projects"]).toBeUndefined();
+      expect(persisted.syncIndex["Projects/Sub"]).toBeUndefined();
+      expect(persisted.syncIndex["Projects/Sub/Plan.md"]).toBeUndefined();
+      expect(persisted.syncIndex["Projects/Todo.md"]).toBeUndefined();
+    });
+
+    it("hard-deletes local files and empty trashed parent folders on remote trash/remove without .trash/ and suppresses push echo loops", async () => {
+      http.seedFolder("dir-folder", "Folder", "root-folder-1");
+      http.seedFile({ id: "f-keep", name: "Keep.md", parentId: "dir-folder", content: "keep" });
+      http.seedFile({ id: "f-removed", name: "Removed.md", parentId: "dir-folder", content: "gone" });
+      http.seedFolder("dir-empty-parent", "TrashedParent", "root-folder-1");
+      http.seedFile({
+        id: "f-child",
+        name: "Child.md",
+        parentId: "dir-empty-parent",
+        content: "child",
+      });
+
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      now += 3_000;
+      http.driveRequests = [];
+
+      // Spy on vault.remove and vault.rmdir to simulate Obsidian firing vault.on("delete")
+      const origRemove = vault.remove.bind(vault);
+      const removeSpy = vi.spyOn(vault, "remove").mockImplementation(async (p) => {
+        await origRemove(p);
+        plugin.onVaultDelete(p);
+      });
+      const origRmdir = vault.rmdir.bind(vault);
+      const rmdirSpy = vi.spyOn(vault, "rmdir").mockImplementation(async (p, rec) => {
+        await origRmdir(p, rec);
+        plugin.onVaultDelete(`${p}/Child.md`);
+        plugin.onVaultDelete(p);
+      });
+
+      http.removeItem("f-removed");
+      http.trashItem("dir-empty-parent");
+
+      await plugin.pullDelta();
+      removeSpy.mockRestore();
+      rmdirSpy.mockRestore();
+
+      // Also simulate async Obsidian delete events firing right after pullDelta
+      plugin.onVaultDelete("Folder/Removed.md");
+      plugin.onVaultDelete("TrashedParent/Child.md");
+      plugin.onVaultDelete("TrashedParent");
+
+      await vi.advanceTimersByTimeAsync(1000);
+
+      expect(await vault.exists("Folder/Keep.md")).toBe(true);
+      expect(await vault.exists("Folder/Removed.md")).toBe(false);
+      expect(await vault.exists("TrashedParent/Child.md")).toBe(false);
+      expect(await vault.exists("TrashedParent")).toBe(false);
+      expect(await vault.exists(".trash")).toBe(false);
+
+      expect(plugin.isEchoSuppressed("Folder/Removed.md")).toBe(true);
+      expect(plugin.isEchoSuppressed("TrashedParent")).toBe(true);
+      expect(plugin.isEchoSuppressed("TrashedParent/Child.md")).toBe(true);
+
+      // Zero non-GET requests to Drive (no push echo loop)
+      expect(http.driveRequests.filter((r) => r.method !== "GET")).toEqual([]);
+
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.syncIndex["Folder/Keep.md"]).toBeDefined();
+      expect(persisted.syncIndex["Folder/Removed.md"]).toBeUndefined();
+      expect(persisted.syncIndex["TrashedParent"]).toBeUndefined();
+      expect(persisted.syncIndex["TrashedParent/Child.md"]).toBeUndefined();
+    });
+
+    it("delete beats edit (local delete vs remote edit): local delete wins regardless of pull/push order", async () => {
+      // Ordering A: pullDelta() runs before flushPendingPush()
+      http.seedFile({
+        id: "f-del-wins-a",
+        name: "LocalDeleteA.md",
+        parentId: "root-folder-1",
+        content: "v1",
+        md5Checksum: "md5-v1",
+      });
+      // Ordering B: flushPendingPush() runs before pullDelta()
+      http.seedFile({
+        id: "f-del-wins-b",
+        name: "LocalDeleteB.md",
+        parentId: "root-folder-1",
+        content: "v1",
+        md5Checksum: "md5-v1",
+      });
+
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      now += 3_000;
+
+      // Ordering A: iOS deletes LocalDeleteA.md, Mac edits it, pullDelta runs BEFORE 500ms push
+      await vault.remove("LocalDeleteA.md");
+      plugin.onVaultDelete("LocalDeleteA.md");
+      http.updateFileContent("f-del-wins-a", "mac edit v2", "md5-v2");
+
+      await plugin.pullDelta();
+      // Must remain deleted locally and not be resurrected by Mac's edit
+      expect(await vault.exists("LocalDeleteA.md")).toBe(false);
+
+      // Now flush the pending local delete
+      await vi.advanceTimersByTimeAsync(500);
+      expect(await vault.exists("LocalDeleteA.md")).toBe(false);
+      expect(http.getItem("f-del-wins-a")?.trashed).toBe(true);
+
+      // Ordering B: iOS deletes LocalDeleteB.md, Mac edits it, push flushes FIRST, then pullDelta runs
+      await vault.remove("LocalDeleteB.md");
+      plugin.onVaultDelete("LocalDeleteB.md");
+      http.updateFileContent("f-del-wins-b", "mac edit v2", "md5-v2");
+
+      await vi.advanceTimersByTimeAsync(500);
+      await plugin.pullDelta();
+
+      expect(await vault.exists("LocalDeleteB.md")).toBe(false);
+      expect(http.getItem("f-del-wins-b")?.trashed).toBe(true);
+
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.syncIndex["LocalDeleteA.md"]).toBeUndefined();
+      expect(persisted.syncIndex["LocalDeleteB.md"]).toBeUndefined();
+    });
+
+    it("delete beats edit (remote delete vs local edit): remote delete hard-deletes local copy regardless of pull/push order", async () => {
+      // Ordering A: pullDelta() runs before flushPendingPush()
+      http.seedFile({
+        id: "f-rdel-a",
+        name: "RemoteDeleteA.md",
+        parentId: "root-folder-1",
+        content: "v1",
+        md5Checksum: "md5-v1",
+      });
+      // Ordering B: flushPendingPush() runs before pullDelta()
+      http.seedFile({
+        id: "f-rdel-b",
+        name: "RemoteDeleteB.md",
+        parentId: "root-folder-1",
+        content: "v1",
+        md5Checksum: "md5-v1",
+      });
+
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      now += 3_000;
+
+      // Ordering A: Mac trashes RemoteDeleteA.md, iOS edits it locally, pullDelta runs first
+      http.trashItem("f-rdel-a");
+      await vault.writeBinary("RemoteDeleteA.md", new TextEncoder().encode("ios edit").buffer);
+      plugin.onVaultModify("RemoteDeleteA.md");
+
+      await plugin.pullDelta();
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(await vault.exists("RemoteDeleteA.md")).toBe(false);
+      expect(http.getItem("f-rdel-a")?.trashed).toBe(true);
+
+      // Ordering B: Mac trashes RemoteDeleteB.md, iOS edits it locally, push flushes BEFORE pullDelta
+      http.trashItem("f-rdel-b");
+      await vault.writeBinary("RemoteDeleteB.md", new TextEncoder().encode("ios edit").buffer);
+      plugin.onVaultModify("RemoteDeleteB.md");
+
+      await vi.advanceTimersByTimeAsync(500);
+      await plugin.pullDelta();
+
+      expect(await vault.exists("RemoteDeleteB.md")).toBe(false);
+      expect(http.getItem("f-rdel-b")?.trashed).toBe(true);
+      expect(notices.notices).toEqual([]);
+
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.syncIndex["RemoteDeleteA.md"]).toBeUndefined();
+      expect(persisted.syncIndex["RemoteDeleteB.md"]).toBeUndefined();
+    });
+  });
 });

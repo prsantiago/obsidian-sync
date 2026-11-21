@@ -58,8 +58,10 @@ export class SyncPluginCore {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private isVisible = true;
   private readonly echoSuppressedUntil = new Map<string, number>();
+  private readonly deleteEchoSuppressedUntil = new Map<string, number>();
   private pendingUpserts = new Map<string, "file" | "folder">();
   private pendingRenames: Array<{ oldPath: string; newPath: string; type: "file" | "folder" }> = [];
+  private pendingDeletes = new Set<string>();
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private suppressedPaths = new Set<string>();
   private followUpRequested = false;
@@ -119,6 +121,12 @@ export class SyncPluginCore {
 
   private suppressEcho(path: string): void {
     this.echoSuppressedUntil.set(path, this.clock.now() + ECHO_SUPPRESSION_WINDOW_MS);
+  }
+
+  private suppressDeleteEcho(path: string): void {
+    const until = this.clock.now() + ECHO_SUPPRESSION_WINDOW_MS;
+    this.echoSuppressedUntil.set(path, until);
+    this.deleteEchoSuppressedUntil.set(path, until);
   }
 
   async handleVisibilityChange(visible: boolean): Promise<void> {
@@ -391,9 +399,16 @@ export class SyncPluginCore {
       const prefix = `${folderPath}/`;
       for (const key of Object.keys(syncIndex)) {
         if (key === folderPath || key.startsWith(prefix)) {
+          this.suppressDeleteEcho(key);
+          this.pendingUpserts.delete(key);
           const removed = syncIndex[key];
           delete syncIndex[key];
           byDriveId.delete(removed.driveId);
+        }
+      }
+      for (const key of Array.from(this.pendingUpserts.keys())) {
+        if (key === folderPath || key.startsWith(prefix)) {
+          this.pendingUpserts.delete(key);
         }
       }
     };
@@ -426,11 +441,12 @@ export class SyncPluginCore {
 
       if (!file || change.removed || file.trashed) {
         if (existing?.type === "folder") {
-          this.suppressEcho(existing.path);
-          if (await this.vault.exists(existing.path)) {
-            await this.vault.rmdir(existing.path, true);
-          }
           removeIndexedSubtree(existing.path);
+          if (await this.vault.exists(existing.path)) {
+            await this.withSuppressedPath(existing.path, () =>
+              this.vault.rmdir(existing.path, true),
+            );
+          }
         }
         continue;
       }
@@ -451,6 +467,9 @@ export class SyncPluginCore {
 
       const relativePath = parentPath ? `${parentPath}/${file.name}` : file.name;
       if (isExcludedPath(relativePath)) {
+        continue;
+      }
+      if ((existing && this.isPendingDelete(existing.path)) || this.isPendingDelete(relativePath)) {
         continue;
       }
 
@@ -505,9 +524,10 @@ export class SyncPluginCore {
 
       if (!file || change.removed || file.trashed) {
         if (existing?.type === "file") {
-          this.suppressEcho(existing.path);
+          this.suppressDeleteEcho(existing.path);
+          this.pendingUpserts.delete(existing.path);
           if (await this.vault.exists(existing.path)) {
-            await this.vault.remove(existing.path);
+            await this.withSuppressedPath(existing.path, () => this.vault.remove(existing.path));
           }
           delete syncIndex[existing.path];
           byDriveId.delete(change.fileId);
@@ -534,6 +554,9 @@ export class SyncPluginCore {
 
       const relativePath = parentPath ? `${parentPath}/${file.name}` : file.name;
       if (isExcludedPath(relativePath)) continue;
+      if ((existing && this.isPendingDelete(existing.path)) || this.isPendingDelete(relativePath)) {
+        continue;
+      }
 
       if (existing && existing.type === "file" && existing.path !== relativePath) {
         this.suppressEcho(existing.path);
@@ -599,13 +622,50 @@ export class SyncPluginCore {
 
     for (const stale of staleEntries) {
       if (!(await this.vault.exists(stale.path))) continue;
-      this.suppressEcho(stale.path);
+      this.suppressDeleteEcho(stale.path);
       if (stale.type === "file") {
-        await this.vault.remove(stale.path);
+        await this.withSuppressedPath(stale.path, () => this.vault.remove(stale.path));
       } else {
-        await this.vault.rmdir(stale.path, true);
+        await this.withSuppressedPath(stale.path, () => this.vault.rmdir(stale.path, true));
       }
     }
+  }
+
+  private isPendingDelete(path: string): boolean {
+    if (this.pendingDeletes.has(path)) {
+      return true;
+    }
+    let idx = path.indexOf("/");
+    while (idx !== -1) {
+      if (this.pendingDeletes.has(path.slice(0, idx))) {
+        return true;
+      }
+      idx = path.indexOf("/", idx + 1);
+    }
+    return false;
+  }
+
+  private isPathSuppressed(path: string, checkDeleteEcho = false): boolean {
+    if (checkDeleteEcho) {
+      const until = this.deleteEchoSuppressedUntil.get(path);
+      if (until !== undefined) {
+        if (this.clock.now() < until) {
+          return true;
+        }
+        this.deleteEchoSuppressedUntil.delete(path);
+      }
+    }
+    if (this.suppressedPaths.has(path)) {
+      return true;
+    }
+    let idx = path.indexOf("/");
+    while (idx !== -1) {
+      if (this.suppressedPaths.has(path.slice(0, idx))) {
+        return true;
+      }
+      idx = path.indexOf("/", idx + 1);
+    }
+    return false;
   }
 
   private async withSuppressedPath<T>(path: string, fn: () => Promise<T>): Promise<T> {
@@ -618,15 +678,16 @@ export class SyncPluginCore {
   }
 
   onVaultCreate(path: string, type: "file" | "folder"): void {
-    if (!this.data.credentials || isExcludedPath(path) || this.suppressedPaths.has(path)) {
+    if (!this.data.credentials || isExcludedPath(path) || this.isPathSuppressed(path)) {
       return;
     }
+    this.pendingDeletes.delete(path);
     this.pendingUpserts.set(path, type);
     this.schedulePushDebounce();
   }
 
   onVaultModify(path: string): void {
-    if (!this.data.credentials || isExcludedPath(path) || this.suppressedPaths.has(path)) {
+    if (!this.data.credentials || isExcludedPath(path) || this.isPathSuppressed(path)) {
       return;
     }
     this.pendingUpserts.set(path, "file");
@@ -662,7 +723,18 @@ export class SyncPluginCore {
   }
 
   onVaultDelete(path: string): void {
+    if (!this.data.credentials || isExcludedPath(path) || this.isPathSuppressed(path, true)) {
+      return;
+    }
     this.pendingUpserts.delete(path);
+    const prefix = `${path}/`;
+    for (const pendingPath of Array.from(this.pendingUpserts.keys())) {
+      if (pendingPath.startsWith(prefix)) {
+        this.pendingUpserts.delete(pendingPath);
+      }
+    }
+    this.pendingDeletes.add(path);
+    this.schedulePushDebounce();
   }
 
   async onVisibilityHidden(): Promise<void> {
@@ -736,7 +808,8 @@ export class SyncPluginCore {
       } while (
         this.followUpRequested ||
         this.pendingUpserts.size > 0 ||
-        this.pendingRenames.length > 0
+        this.pendingRenames.length > 0 ||
+        this.pendingDeletes.size > 0
       );
     }).finally(() => {
       this.pushInFlight = null;
@@ -747,7 +820,34 @@ export class SyncPluginCore {
 
   private async runFlushOnce(): Promise<void> {
     const creds = this.data.credentials;
-    if (!creds || (this.pendingUpserts.size === 0 && this.pendingRenames.length === 0)) return;
+    if (
+      !creds ||
+      (this.pendingUpserts.size === 0 &&
+        this.pendingRenames.length === 0 &&
+        this.pendingDeletes.size === 0)
+    ) {
+      return;
+    }
+
+    const deletes = Array.from(this.pendingDeletes).sort((a, b) => a.length - b.length);
+    this.pendingDeletes.clear();
+
+    for (const path of deletes) {
+      const existing = this.data.syncIndex[path];
+      if (!existing) {
+        continue;
+      }
+      await this.drive.trashFile(existing.driveId);
+      delete this.data.syncIndex[path];
+      if (existing.type === "folder") {
+        const prefix = `${path}/`;
+        for (const key of Object.keys(this.data.syncIndex)) {
+          if (key.startsWith(prefix)) {
+            delete this.data.syncIndex[key];
+          }
+        }
+      }
+    }
 
     const renames = this.pendingRenames.splice(0, this.pendingRenames.length);
     for (const { oldPath, newPath, type } of renames) {
@@ -815,12 +915,35 @@ export class SyncPluginCore {
       const parentId = await this.ensureDriveFolder(parentPath, creds.rootFolderId);
 
       const existing = this.data.syncIndex[path];
-      const meta = await this.drive.uploadFile({
-        fileId: existing?.driveId,
-        name,
-        parentId,
-        data,
-      });
+      let meta: DriveFileMetadata;
+      try {
+        meta = await this.drive.uploadFile({
+          fileId: existing?.driveId,
+          name,
+          parentId,
+          data,
+        });
+      } catch (err) {
+        if (existing && err instanceof DriveApiError && err.status === 404) {
+          // Remote file was deleted/trashed before local edit synced: delete beats edit.
+          this.suppressEcho(path);
+          if (await this.vault.exists(path)) {
+            await this.withSuppressedPath(path, () => this.vault.remove(path));
+          }
+          delete this.data.syncIndex[path];
+          continue;
+        }
+        throw err;
+      }
+
+      if (existing && meta.trashed) {
+        this.suppressEcho(path);
+        if (await this.vault.exists(path)) {
+          await this.withSuppressedPath(path, () => this.vault.remove(path));
+        }
+        delete this.data.syncIndex[path];
+        continue;
+      }
 
       this.data.syncIndex[path] = {
         path,

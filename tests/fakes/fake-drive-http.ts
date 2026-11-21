@@ -115,6 +115,33 @@ export class FakeGoogleDriveHttp implements HttpTransport {
     this.recordChange(id);
   }
 
+  trashItem(id: string): void {
+    const item = this.items.get(id);
+    if (!item) {
+      throw new Error(`FakeGoogleDriveHttp: item not found: ${id}`);
+    }
+    item.trashed = true;
+    item.modifiedTime = new Date(this.nowFn()).toISOString();
+    this.recordChange(id);
+  }
+
+  removeItem(id: string): void {
+    this.items.delete(id);
+    this.recordChange(id, true);
+  }
+
+  updateFileContent(id: string, content: string | Uint8Array, md5Checksum?: string): void {
+    const item = this.items.get(id);
+    if (!item) {
+      throw new Error(`FakeGoogleDriveHttp: item not found: ${id}`);
+    }
+    const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content.slice();
+    item.content = bytes;
+    item.md5Checksum = md5Checksum ?? this.fakeMd5(bytes);
+    item.modifiedTime = new Date(this.nowFn()).toISOString();
+    this.recordChange(id);
+  }
+
   recordChange(fileId: string, removed = false): string {
     this.changeSeq += 1;
     this.startPageToken = String(this.changeSeq);
