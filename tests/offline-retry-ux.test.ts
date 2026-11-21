@@ -47,11 +47,18 @@ describe("Offline queueing, reconnect auto-sync, retries & error UX (Ticket #8)"
     vi.useRealTimers();
   });
 
-  it("persists offline mutations across app restart, emits zero notices, and auto-syncs on online reconnect", async () => {
+  it("persists offline mutations (including deletions) across app restart, emits zero notices, and auto-syncs on online reconnect", async () => {
+    http.seedFile({
+      id: "to-delete-1",
+      name: "DeleteMeOffline.md",
+      parentId: "root-folder-1",
+      content: "will be deleted offline",
+    });
     await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+    expect(await vault.exists("DeleteMeOffline.md")).toBe(true);
     const requestsBeforeOffline = http.driveRequests.length;
 
-    // Go offline and perform local mutations
+    // Go offline and perform local mutations (create, rename, and delete)
     online = false;
     await vault.writeBinary("OfflineNote.md", new TextEncoder().encode("written offline").buffer);
     plugin.onVaultCreate("OfflineNote.md", "file");
@@ -61,12 +68,18 @@ describe("Offline queueing, reconnect auto-sync, retries & error UX (Ticket #8)"
     await vault.rename("Draft.md", "RenamedOffline.md");
     plugin.onVaultRename("Draft.md", "RenamedOffline.md", "file");
 
+    await vault.remove("DeleteMeOffline.md");
+    plugin.onVaultDelete("DeleteMeOffline.md");
+
     await vi.advanceTimersByTimeAsync(1000);
 
     // Zero network calls, zero notices, zero errors while offline
     expect(http.driveRequests.length).toBe(requestsBeforeOffline);
     expect(notices.notices).toHaveLength(0);
     expect(plugin.getErrorLog()).toEqual([]);
+
+    const persistedOffline = (await vault.loadPluginData()) as PluginData;
+    expect(persistedOffline.pendingQueue?.deletes).toContain("DeleteMeOffline.md");
 
     // Simulate iOS app restart while still offline
     plugin.unload();
@@ -87,12 +100,15 @@ describe("Offline queueing, reconnect auto-sync, retries & error UX (Ticket #8)"
 
     expect(http.findItemByName("OfflineNote.md", "root-folder-1")).toBeDefined();
     expect(http.findItemByName("RenamedOffline.md", "root-folder-1")).toBeDefined();
+    expect(http.getItem("to-delete-1")?.trashed).toBe(true);
+    expect(await vault.exists("DeleteMeOffline.md")).toBe(false);
     expect(notices.notices).toHaveLength(0);
     expect(restarted.getErrorLog()).toEqual([]);
 
     const persisted = (await vault.loadPluginData()) as PluginData;
     expect(persisted.pendingQueue?.upserts ?? []).toHaveLength(0);
     expect(persisted.pendingQueue?.renames ?? []).toHaveLength(0);
+    expect(persisted.pendingQueue?.deletes ?? []).toHaveLength(0);
 
     restarted.unload();
   });

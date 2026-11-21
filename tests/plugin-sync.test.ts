@@ -613,6 +613,78 @@ describe("Google Drive Sync Plugin (Primary Seam)", () => {
       expect(freshData.syncIndex["Recovered.md"]?.driveId).toBe("f-new");
     });
 
+    it("preserves unpushed local edits & pending deletes and resolves edit-vs-edit conflicts during HTTP 410 full subtree reconciliation", async () => {
+      http.seedFile({
+        id: "f-410-conflict",
+        name: "Conflict410.md",
+        parentId: "root-folder-1",
+        content: "baseline",
+        modifiedTime: new Date(now).toISOString(),
+      });
+      http.seedFile({
+        id: "f-410-local-only",
+        name: "UnpushedLocalEdit410.md",
+        parentId: "root-folder-1",
+        content: "baseline",
+        modifiedTime: new Date(now).toISOString(),
+      });
+      http.seedFile({
+        id: "f-410-del",
+        name: "PendingDelete410.md",
+        parentId: "root-folder-1",
+        content: "to be deleted locally",
+        modifiedTime: new Date(now).toISOString(),
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      const oldData = (await vault.loadPluginData()) as PluginData;
+      http.expirePageToken(oldData.startPageToken!);
+
+      // Remote edits Conflict410.md
+      now += 10_000;
+      http.updateFileContent("f-410-conflict", "remote edit during 410");
+
+      // Local edits Conflict410.md (newer), edits UnpushedLocalEdit410.md, and deletes PendingDelete410.md
+      now += 20_000;
+      await vault.writeBinary(
+        "Conflict410.md",
+        new TextEncoder().encode("local edit newer during 410").buffer,
+      );
+      plugin.onVaultModify("Conflict410.md");
+
+      await vault.writeBinary(
+        "UnpushedLocalEdit410.md",
+        new TextEncoder().encode("unpushed local edit").buffer,
+      );
+      plugin.onVaultModify("UnpushedLocalEdit410.md");
+
+      await vault.remove("PendingDelete410.md");
+      plugin.onVaultDelete("PendingDelete410.md");
+
+      // Trigger pullDelta() before push flushes -> hits HTTP 410 -> reconcileFullSubtree()
+      await plugin.pullDelta();
+
+      // 1. Conflict410.md resolved as edit-vs-edit conflict without losing local edit
+      expect(vault.readTextSync("Conflict410.md")).toBe("local edit newer during 410");
+      const conflictCopies = vault
+        .listAllFilePaths()
+        .filter((p) => p.startsWith("Conflict410 (conflict"));
+      expect(conflictCopies).toHaveLength(1);
+      expect(vault.readTextSync(conflictCopies[0])).toBe("remote edit during 410");
+
+      // 2. UnpushedLocalEdit410.md preserved locally
+      expect(vault.readTextSync("UnpushedLocalEdit410.md")).toBe("unpushed local edit");
+
+      // 3. PendingDelete410.md NOT resurrected locally
+      expect(await vault.exists("PendingDelete410.md")).toBe(false);
+
+      // 4. Flushing pending push uploads UnpushedLocalEdit410.md and trashes PendingDelete410.md on Drive
+      await plugin.flushPendingPush();
+      expect(
+        new TextDecoder().decode(http.getItem("f-410-local-only")?.content),
+      ).toBe("unpushed local edit");
+      expect(http.getItem("f-410-del")?.trashed).toBe(true);
+    });
+
     it("suppresses push echo loops on pulled writes and renames and issues zero Drive write requests", async () => {
       http.seedFile({
         id: "f-echo",
@@ -696,6 +768,7 @@ describe("Google Drive Sync Plugin (Primary Seam)", () => {
       });
       // Re-run initial pull to track Journal.md
       await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      now += 3_000;
 
       await vault.writeBinary("Journal.md", new TextEncoder().encode("v1").buffer);
       plugin.onVaultModify("Journal.md");
@@ -788,6 +861,7 @@ describe("Google Drive Sync Plugin (Primary Seam)", () => {
         content: "hello",
       });
       await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      now += 3_000;
 
       // Move and rename Draft.md -> Archive/Published.md
       vault.simulateRename("Inbox/Draft.md", "Archive/Published.md");
@@ -835,13 +909,21 @@ describe("Google Drive Sync Plugin (Primary Seam)", () => {
       expect(http.multipartUploadCount).toBe(1);
     });
 
-    it("flushes pending changes immediately when syncNow() command is triggered", async () => {
+    it("flushes pending changes and pulls remote changes immediately when syncNow() command is triggered", async () => {
       await vault.writeBinary("ManualSync.md", new TextEncoder().encode("sync me").buffer);
       plugin.onVaultCreate("ManualSync.md", "file");
+
+      http.seedFile({
+        id: "remote-syncnow-1",
+        name: "FromRemoteOnSyncNow.md",
+        parentId: "root-folder-1",
+        content: "pulled by syncNow",
+      });
 
       await plugin.syncNow();
       expect(http.findItemByName("ManualSync.md", "root-folder-1")).toBeDefined();
       expect(http.multipartUploadCount).toBe(1);
+      expect(vault.readTextSync("FromRemoteOnSyncNow.md")).toBe("pulled by syncNow");
 
       await vi.advanceTimersByTimeAsync(500);
       expect(http.multipartUploadCount).toBe(1);
@@ -935,6 +1017,79 @@ describe("Google Drive Sync Plugin (Primary Seam)", () => {
 
       await vi.advanceTimersByTimeAsync(1000);
       expect(http.multipartUploadCount).toBe(0);
+    });
+
+    it("suppresses echo pushes when vault emits create, modify, rename, or delete events during delta pull", async () => {
+      http.seedFolder("dir-orig", "OrigFolder", "root-folder-1");
+      http.seedFile({
+        id: "f-rename",
+        name: "BeforeRename.md",
+        parentId: "dir-orig",
+        content: "hello",
+      });
+      http.seedFile({
+        id: "f-move-out",
+        name: "MovedOut.md",
+        parentId: "root-folder-1",
+        content: "bye",
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      now += 3_000;
+
+      // Wire vault methods to emit create/modify/rename/delete events as Obsidian does
+      const origMkdir = vault.mkdir.bind(vault);
+      const mkdirSpy = vi.spyOn(vault, "mkdir").mockImplementation(async (p) => {
+        await origMkdir(p);
+        plugin.onVaultCreate(p, "folder");
+      });
+      const origWrite = vault.writeBinary.bind(vault);
+      const writeSpy = vi.spyOn(vault, "writeBinary").mockImplementation(async (p, d) => {
+        const st = await origWrite(p, d);
+        plugin.onVaultCreate(p, "file");
+        plugin.onVaultModify(p);
+        return st;
+      });
+      const origRename = vault.rename.bind(vault);
+      const renameSpy = vi.spyOn(vault, "rename").mockImplementation(async (oldP, newP) => {
+        const st = await vault.stat(oldP);
+        await origRename(oldP, newP);
+        plugin.onVaultRename(oldP, newP, st?.type ?? "file");
+      });
+      const origRemove = vault.remove.bind(vault);
+      const removeSpy = vi.spyOn(vault, "remove").mockImplementation(async (p) => {
+        await origRemove(p);
+        plugin.onVaultDelete(p);
+      });
+
+      // Remote creates a folder, renames OrigFolder -> RenamedFolder, renames BeforeRename.md -> AfterRename.md,
+      // and moves MovedOut.md outside the root folder
+      http.seedFolder("dir-new", "NewRemoteFolder", "root-folder-1");
+      http.renameOrMoveItem("dir-orig", { name: "RenamedFolder" });
+      http.renameOrMoveItem("f-rename", { name: "AfterRename.md" });
+      http.renameOrMoveItem("f-move-out", { parentId: "outside-root" });
+
+      http.driveRequests = [];
+      await plugin.pullDelta();
+
+      // Also simulate delayed async echo callbacks arriving 100ms after pullDelta within the 2s echo window
+      now += 100;
+      plugin.onVaultCreate("NewRemoteFolder", "folder");
+      plugin.onVaultRename("OrigFolder", "RenamedFolder", "folder");
+      plugin.onVaultRename("RenamedFolder/BeforeRename.md", "RenamedFolder/AfterRename.md", "file");
+      plugin.onVaultDelete("MovedOut.md");
+
+      mkdirSpy.mockRestore();
+      writeSpy.mockRestore();
+      renameSpy.mockRestore();
+      removeSpy.mockRestore();
+
+      // Advance past debounce timer: zero non-GET Drive requests should be made
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(http.driveRequests.filter((r) => r.method !== "GET")).toEqual([]);
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.pendingQueue?.upserts ?? []).toEqual([]);
+      expect(persisted.pendingQueue?.renames ?? []).toEqual([]);
+      expect(persisted.pendingQueue?.deletes ?? []).toEqual([]);
     });
   });
 
@@ -1453,6 +1608,85 @@ describe("Google Drive Sync Plugin (Primary Seam)", () => {
       const remoteConflict = http.findItemByName("diagram (conflict 2023-11-14 22-14).png", "folder-assets");
       expect(remoteConflict?.content).toEqual(localBytes);
       expect(notices.notices.some((m) => m.message.includes("assets/diagram.png"))).toBe(true);
+    });
+
+    it("computes standard RFC 1321 MD5 checksums and preserves unchanged-local vs edit-conflict detection across app restarts", async () => {
+      const { computeMd5Hex, computeContentHash } = await import("../src/conflict");
+      expect(computeMd5Hex(new TextEncoder().encode("").buffer)).toBe(
+        "d41d8cd98f00b204e9800998ecf8427e",
+      );
+      expect(computeMd5Hex(new TextEncoder().encode("abc").buffer)).toBe(
+        "900150983cd24fb0d6963f7d28e17f72",
+      );
+      expect(
+        computeContentHash(
+          new TextEncoder().encode(
+            "12345678901234567890123456789012345678901234567890123456789012345678901234567890",
+          ).buffer,
+        ),
+      ).toBe("57edf4a22be3c955ac49da2e2107b67a");
+
+      http.seedFile({
+        id: "f-unchanged",
+        name: "UnchangedAfterRestart.md",
+        parentId: "root-folder-1",
+        content: "baseline content",
+        modifiedTime: new Date(now).toISOString(),
+      });
+      http.seedFile({
+        id: "f-conflict",
+        name: "ConflictAfterRestart.md",
+        parentId: "root-folder-1",
+        content: "baseline content",
+        modifiedTime: new Date(now).toISOString(),
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+
+      // Simulate app restart so in-memory baselineHashes map is empty and only persisted syncIndex.md5Checksum exists
+      plugin.unload();
+      const restarted = new SyncPluginCore({
+        vault,
+        http,
+        notice: notices,
+        clock: { now: () => now },
+      });
+      await restarted.load();
+
+      // 1. Remote updates both files
+      now += 10_000;
+      http.updateFileContent("f-unchanged", "remote updated content");
+      http.updateFileContent("f-conflict", "remote conflicting content");
+
+      // 2. Local touches UnchangedAfterRestart.md without changing bytes (mtime advances),
+      //    and genuinely modifies ConflictAfterRestart.md
+      now += 20_000;
+      await vault.writeBinary(
+        "UnchangedAfterRestart.md",
+        new TextEncoder().encode("baseline content").buffer,
+      );
+      await vault.writeBinary(
+        "ConflictAfterRestart.md",
+        new TextEncoder().encode("local conflicting content").buffer,
+      );
+      restarted.onVaultModify("ConflictAfterRestart.md");
+
+      await restarted.pullDelta();
+
+      // UnchangedAfterRestart.md should fast-forward to remote without a conflict copy
+      expect(vault.readTextSync("UnchangedAfterRestart.md")).toBe("remote updated content");
+      expect(
+        vault.listAllFilePaths().filter((p) => p.startsWith("UnchangedAfterRestart (conflict")),
+      ).toEqual([]);
+
+      // ConflictAfterRestart.md should create a conflict copy
+      expect(vault.readTextSync("ConflictAfterRestart.md")).toBe("local conflicting content");
+      const conflictCopies = vault
+        .listAllFilePaths()
+        .filter((p) => p.startsWith("ConflictAfterRestart (conflict"));
+      expect(conflictCopies).toHaveLength(1);
+      expect(vault.readTextSync(conflictCopies[0])).toBe("remote conflicting content");
+
+      restarted.unload();
     });
   });
 });

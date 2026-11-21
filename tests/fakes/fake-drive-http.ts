@@ -1,3 +1,4 @@
+import { computeMd5Hex } from "../../src/conflict";
 import {
   GOOGLE_DRIVE_API_BASE,
   GOOGLE_FOLDER_MIME,
@@ -95,7 +96,7 @@ export class FakeGoogleDriveHttp implements HttpTransport {
       mimeType: opts.mimeType ?? "text/markdown",
       parents: [opts.parentId],
       content: bytes,
-      md5Checksum: opts.md5Checksum ?? `md5-${opts.id}`,
+      md5Checksum: opts.md5Checksum ?? this.fakeMd5(bytes),
       modifiedTime: opts.modifiedTime ?? "2026-01-01T00:00:00.000Z",
       trashed: opts.trashed ?? false,
     });
@@ -580,15 +581,7 @@ export class FakeGoogleDriveHttp implements HttpTransport {
   }
 
   private fakeMd5(bytes: Uint8Array): string {
-    let h1 = 0x811c9dc5;
-    let h2 = 0x9e3779b9;
-    for (let i = 0; i < bytes.length; i++) {
-      h1 ^= bytes[i];
-      h1 = Math.imul(h1, 0x01000193) >>> 0;
-      h2 ^= bytes[i] + i;
-      h2 = Math.imul(h2, 0x85ebca6b) >>> 0;
-    }
-    return h1.toString(16).padStart(8, "0") + h2.toString(16).padStart(8, "0") + bytes.length.toString(16).padStart(16, "0");
+    return computeMd5Hex(bytes);
   }
 
   private parseMultipartRelated(

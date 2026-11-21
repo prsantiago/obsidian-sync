@@ -28,6 +28,14 @@ export interface DriveChangesResult {
   newStartPageToken: string;
 }
 
+export interface DriveUploadParams {
+  fileId?: string;
+  name: string;
+  parentId: string;
+  mimeType?: string;
+  data: ArrayBuffer;
+}
+
 export class DriveApiError extends Error {
   readonly status: number;
 
@@ -307,13 +315,7 @@ export class GoogleDriveClient {
   /**
    * Uploads a file <= 5 MB using Google Drive's multipart/related upload protocol.
    */
-  async uploadFileMultipart(params: {
-    fileId?: string;
-    name: string;
-    parentId: string;
-    mimeType?: string;
-    data: ArrayBuffer;
-  }): Promise<DriveFileMetadata> {
+  async uploadFileMultipart(params: DriveUploadParams): Promise<DriveFileMetadata> {
     const boundary = `obsidian_sync_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
     const contentMime = params.mimeType ?? "application/octet-stream";
     const metadata: Record<string, unknown> = params.fileId
@@ -363,13 +365,7 @@ export class GoogleDriveClient {
   /**
    * Uploads a file > 5 MB using Google Drive's resumable upload protocol.
    */
-  async uploadFileResumable(params: {
-    fileId?: string;
-    name: string;
-    parentId: string;
-    mimeType?: string;
-    data: ArrayBuffer;
-  }): Promise<DriveFileMetadata> {
+  async uploadFileResumable(params: DriveUploadParams): Promise<DriveFileMetadata> {
     const contentMime = params.mimeType ?? "application/octet-stream";
     const metadata: Record<string, unknown> = params.fileId
       ? { name: params.name }
@@ -429,13 +425,7 @@ export class GoogleDriveClient {
   /**
    * Uploads a file using multipart (<= 5 MB) or resumable (> 5 MB) upload.
    */
-  async uploadFile(params: {
-    fileId?: string;
-    name: string;
-    parentId: string;
-    mimeType?: string;
-    data: ArrayBuffer;
-  }): Promise<DriveFileMetadata> {
+  async uploadFile(params: DriveUploadParams): Promise<DriveFileMetadata> {
     if (params.data.byteLength > MULTIPART_UPLOAD_MAX_BYTES) {
       return this.uploadFileResumable(params);
     }

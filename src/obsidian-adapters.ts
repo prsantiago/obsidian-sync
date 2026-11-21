@@ -30,11 +30,15 @@ export class ObsidianVaultAdapter implements VaultPort {
     await this.adapter.mkdir(path);
   }
 
-  async writeBinary(path: string, data: ArrayBuffer): Promise<VaultStat> {
+  private async ensureParentFolder(path: string): Promise<void> {
     const parent = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
     if (parent && !(await this.adapter.exists(parent))) {
       await this.adapter.mkdir(parent);
     }
+  }
+
+  async writeBinary(path: string, data: ArrayBuffer): Promise<VaultStat> {
+    await this.ensureParentFolder(path);
     await this.adapter.writeBinary(path, data);
     const st = await this.adapter.stat(path);
     return {
@@ -49,10 +53,7 @@ export class ObsidianVaultAdapter implements VaultPort {
   }
 
   async rename(oldPath: string, newPath: string): Promise<void> {
-    const parent = newPath.includes("/") ? newPath.slice(0, newPath.lastIndexOf("/")) : "";
-    if (parent && !(await this.adapter.exists(parent))) {
-      await this.adapter.mkdir(parent);
-    }
+    await this.ensureParentFolder(newPath);
     await this.adapter.rename(oldPath, newPath);
   }
 

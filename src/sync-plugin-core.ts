@@ -35,7 +35,7 @@ export interface SyncPluginCoreDeps {
 }
 
 function emptyPendingQueue(): PendingQueue {
-  return { upserts: [], renames: [] };
+  return { upserts: [], renames: [], deletes: [] };
 }
 
 function emptyPluginData(): PluginData {
@@ -54,6 +54,7 @@ function normalizePluginData(raw: unknown): PluginData {
   }
   const rec = raw as Partial<PluginData>;
   const rawQueue = rec.pendingQueue;
+  const rawDeletes = (rawQueue as { deletes?: unknown } | undefined)?.deletes;
   return {
     credentials: rec.credentials ?? null,
     syncIndex: rec.syncIndex ?? {},
@@ -61,6 +62,9 @@ function normalizePluginData(raw: unknown): PluginData {
     pendingQueue: {
       upserts: Array.isArray(rawQueue?.upserts) ? rawQueue.upserts : [],
       renames: Array.isArray(rawQueue?.renames) ? rawQueue.renames : [],
+      deletes: Array.isArray(rawDeletes)
+        ? rawDeletes.filter((d): d is string => typeof d === "string")
+        : [],
     },
     errorLog: Array.isArray(rec.errorLog) ? rec.errorLog : [],
   };
@@ -212,7 +216,6 @@ export class SyncPluginCore {
     this.pendingUpserts.clear();
     this.pendingRenames = [];
     this.pendingDeletes.clear();
-    this.pendingDeletes.clear();
     const queue = this.data.pendingQueue;
     if (!queue) return;
     for (const item of queue.upserts) {
@@ -341,6 +344,7 @@ export class SyncPluginCore {
     rootRelativePrefix: string,
     syncIndex: Record<string, SyncIndexEntry>,
     byDriveId?: Map<string, SyncIndexEntry>,
+    oldSyncIndex?: Record<string, SyncIndexEntry>,
   ): Promise<void> {
     const queue: Array<{ folderId: string; relativePrefix: string }> = [
       { folderId: rootFolderId, relativePrefix: rootRelativePrefix },
@@ -356,6 +360,15 @@ export class SyncPluginCore {
           : item.name;
 
         if (isExcludedPath(relativePath)) {
+          continue;
+        }
+
+        if (this.isPendingDelete(relativePath)) {
+          const pendingOld = oldSyncIndex?.[relativePath];
+          if (pendingOld) {
+            syncIndex[relativePath] = pendingOld;
+            byDriveId?.set(pendingOld.driveId, pendingOld);
+          }
           continue;
         }
 
@@ -381,6 +394,63 @@ export class SyncPluginCore {
 
         if (isGoogleWorkspaceNativeMime(item.mimeType)) {
           continue;
+        }
+
+        if (oldSyncIndex) {
+          const oldEntry = oldSyncIndex[relativePath];
+          const localStat = await this.vault.stat(relativePath);
+          if (localStat && localStat.type === "file") {
+            const localBytes = await this.vault.readBinary(relativePath);
+            const localUnchanged = this.isLocalContentUnchanged(relativePath, localBytes, oldEntry);
+            const hasUnpushedLocalEdit = this.pendingUpserts.has(relativePath) || !localUnchanged;
+            if (hasUnpushedLocalEdit && !localUnchanged) {
+              const remoteUnchanged =
+                Boolean(oldEntry?.md5Checksum && item.md5Checksum) &&
+                oldEntry!.md5Checksum === item.md5Checksum;
+              if (remoteUnchanged && oldEntry) {
+                const keptEntry: SyncIndexEntry = {
+                  ...oldEntry,
+                  driveId: item.id,
+                  parentId: current.folderId,
+                };
+                syncIndex[relativePath] = keptEntry;
+                byDriveId?.set(item.id, keptEntry);
+                this.pendingUpserts.set(relativePath, "file");
+                continue;
+              }
+
+              const remoteBytes = await this.drive.downloadFile(item.id);
+              if (bytesEqual(localBytes, remoteBytes)) {
+                const convergedEntry: SyncIndexEntry = {
+                  path: relativePath,
+                  driveId: item.id,
+                  parentId: current.folderId,
+                  md5Checksum: item.md5Checksum ?? null,
+                  localMtime: localStat.mtime,
+                  remoteModifiedTime: item.modifiedTime,
+                  type: "file",
+                };
+                syncIndex[relativePath] = convergedEntry;
+                byDriveId?.set(item.id, convergedEntry);
+                this.baselineHashes.set(relativePath, computeContentHash(localBytes));
+                this.pendingUpserts.delete(relativePath);
+                continue;
+              }
+
+              await this.resolveEditConflict({
+                path: relativePath,
+                parentId: current.folderId,
+                driveId: item.id,
+                localBytes,
+                localMtime: localStat.mtime,
+                remoteBytes,
+                remoteMeta: item,
+                syncIndex,
+                byDriveId,
+              });
+              continue;
+            }
+          }
         }
 
         const content = await this.drive.downloadFile(item.id);
@@ -580,20 +650,7 @@ export class SyncPluginCore {
     };
 
     const renameIndexedSubtree = (oldFolderPath: string, newFolderPath: string) => {
-      const oldPrefix = `${oldFolderPath}/`;
-      const entriesToMove: SyncIndexEntry[] = [];
-      for (const key of Object.keys(syncIndex)) {
-        if (key.startsWith(oldPrefix)) {
-          entriesToMove.push(syncIndex[key]);
-          delete syncIndex[key];
-        }
-      }
-      for (const child of entriesToMove) {
-        const updatedPath = `${newFolderPath}/${child.path.slice(oldPrefix.length)}`;
-        const updatedChild: SyncIndexEntry = { ...child, path: updatedPath };
-        syncIndex[updatedPath] = updatedChild;
-        byDriveId.set(updatedChild.driveId, updatedChild);
-      }
+      this.renameIndexedSubtree(syncIndex, oldFolderPath, newFolderPath, byDriveId);
     };
 
     // Pass 1: Folders (moves out, renames/moves within, creates/moves into)
@@ -622,11 +679,12 @@ export class SyncPluginCore {
       if (parentPath === null) {
         // Folder moved outside synced root subtree
         if (existing?.type === "folder") {
-          this.suppressEcho(existing.path);
-          if (await this.vault.exists(existing.path)) {
-            await this.vault.rmdir(existing.path, true);
-          }
           removeIndexedSubtree(existing.path);
+          if (await this.vault.exists(existing.path)) {
+            await this.withSuppressedPath(existing.path, () =>
+              this.vault.rmdir(existing.path, true),
+            );
+          }
         }
         continue;
       }
@@ -644,9 +702,13 @@ export class SyncPluginCore {
           this.suppressEcho(existing.path);
           this.suppressEcho(relativePath);
           if (await this.vault.exists(existing.path)) {
-            await this.vault.rename(existing.path, relativePath);
+            await this.withSuppressedPath(existing.path, () =>
+              this.withSuppressedPath(relativePath, () =>
+                this.vault.rename(existing.path, relativePath),
+              ),
+            );
           } else if (!(await this.vault.exists(relativePath))) {
-            await this.vault.mkdir(relativePath);
+            await this.withSuppressedPath(relativePath, () => this.vault.mkdir(relativePath));
           }
           delete syncIndex[existing.path];
           renameIndexedSubtree(existing.path, relativePath);
@@ -661,8 +723,9 @@ export class SyncPluginCore {
         byDriveId.set(file.id, entry);
       } else {
         // New folder or external folder moved INTO synced root subtree
+        this.suppressEcho(relativePath);
         if (!(await this.vault.exists(relativePath))) {
-          await this.vault.mkdir(relativePath);
+          await this.withSuppressedPath(relativePath, () => this.vault.mkdir(relativePath));
         }
         const entry: SyncIndexEntry = {
           path: relativePath,
@@ -708,9 +771,9 @@ export class SyncPluginCore {
       if (parentPath === null) {
         // File moved outside synced root subtree
         if (existing?.type === "file") {
-          this.suppressEcho(existing.path);
+          this.suppressDeleteEcho(existing.path);
           if (await this.vault.exists(existing.path)) {
-            await this.vault.remove(existing.path);
+            await this.withSuppressedPath(existing.path, () => this.vault.remove(existing.path));
           }
           delete syncIndex[existing.path];
           byDriveId.delete(file.id);
@@ -728,7 +791,11 @@ export class SyncPluginCore {
         this.suppressEcho(existing.path);
         this.suppressEcho(relativePath);
         if (await this.vault.exists(existing.path)) {
-          await this.vault.rename(existing.path, relativePath);
+          await this.withSuppressedPath(existing.path, () =>
+            this.withSuppressedPath(relativePath, () =>
+              this.vault.rename(existing.path, relativePath),
+            ),
+          );
         }
         delete syncIndex[existing.path];
       }
@@ -761,9 +828,11 @@ export class SyncPluginCore {
           this.pendingUpserts.has(relativePath);
         if (localModified) {
           const localBytes = await this.vault.readBinary(relativePath);
-          const baselineHash = this.baselineHashes.get(relativePath);
-          const localContentUnchanged =
-            baselineHash !== undefined && computeContentHash(localBytes) === baselineHash;
+          const localContentUnchanged = this.isLocalContentUnchanged(
+            relativePath,
+            localBytes,
+            existing,
+          );
           if (!localContentUnchanged) {
             if (bytesEqual(localBytes, content)) {
               const convergedEntry: SyncIndexEntry = {
@@ -824,10 +893,59 @@ export class SyncPluginCore {
     await this.vault.savePluginData(this.data);
   }
 
+  private renameIndexedSubtree(
+    syncIndex: Record<string, SyncIndexEntry>,
+    oldFolderPath: string,
+    newFolderPath: string,
+    byDriveId?: Map<string, SyncIndexEntry>,
+  ): void {
+    const oldPrefix = `${oldFolderPath}/`;
+    const entriesToMove: SyncIndexEntry[] = [];
+    for (const key of Object.keys(syncIndex)) {
+      if (key.startsWith(oldPrefix)) {
+        entriesToMove.push(syncIndex[key]);
+        delete syncIndex[key];
+      }
+    }
+    for (const child of entriesToMove) {
+      const updatedPath = `${newFolderPath}/${child.path.slice(oldPrefix.length)}`;
+      const updatedChild: SyncIndexEntry = { ...child, path: updatedPath };
+      syncIndex[updatedPath] = updatedChild;
+      byDriveId?.set(updatedChild.driveId, updatedChild);
+    }
+  }
+
+  private async removeLocalFileDeletedOnRemote(path: string): Promise<void> {
+    this.suppressDeleteEcho(path);
+    if (await this.vault.exists(path)) {
+      await this.withSuppressedPath(path, () => this.vault.remove(path));
+    }
+    delete this.data.syncIndex[path];
+    this.baselineHashes.delete(path);
+    this.pendingUpserts.delete(path);
+  }
+
+  private isLocalContentUnchanged(
+    path: string,
+    localBytes: ArrayBuffer,
+    existing?: SyncIndexEntry,
+  ): boolean {
+    const localHash = computeContentHash(localBytes);
+    if (existing?.md5Checksum && localHash === existing.md5Checksum) {
+      return true;
+    }
+    const inMemoryBaseline = this.baselineHashes.get(path);
+    return inMemoryBaseline !== undefined && localHash === inMemoryBaseline;
+  }
+
   private async reconcileFullSubtree(): Promise<void> {
+    const creds = this.data.credentials;
+    if (!creds) return;
+
     const oldSyncIndex = this.data.syncIndex;
-    await this.initialPull();
-    const newSyncIndex = this.data.syncIndex;
+    const startPageToken = await this.drive.getStartPageToken();
+    const newSyncIndex: Record<string, SyncIndexEntry> = {};
+    await this.pullSubtree(creds.rootFolderId, "", newSyncIndex, undefined, oldSyncIndex);
 
     // Remove any previously synced files/folders that are no longer in the Drive subtree.
     const staleEntries = Object.values(oldSyncIndex)
@@ -835,6 +953,7 @@ export class SyncPluginCore {
       .sort((a, b) => b.path.length - a.path.length);
 
     for (const stale of staleEntries) {
+      this.pendingUpserts.delete(stale.path);
       if (!(await this.vault.exists(stale.path))) continue;
       this.suppressDeleteEcho(stale.path);
       if (stale.type === "file") {
@@ -843,43 +962,55 @@ export class SyncPluginCore {
         await this.withSuppressedPath(stale.path, () => this.vault.rmdir(stale.path, true));
       }
     }
+
+    this.data = {
+      ...this.data,
+      syncIndex: newSyncIndex,
+      startPageToken,
+    };
+    this.syncPendingQueueToData();
+    await this.vault.savePluginData(this.data);
+  }
+
+  private hasPathOrAncestor(path: string, predicate: (candidate: string) => boolean): boolean {
+    if (predicate(path)) {
+      return true;
+    }
+    let idx = path.indexOf("/");
+    while (idx !== -1) {
+      if (predicate(path.slice(0, idx))) {
+        return true;
+      }
+      idx = path.indexOf("/", idx + 1);
+    }
+    return false;
   }
 
   private isPendingDelete(path: string): boolean {
-    if (this.pendingDeletes.has(path)) {
-      return true;
+    return this.hasPathOrAncestor(path, (candidate) => this.pendingDeletes.has(candidate));
+  }
+
+  private isDeleteEchoSuppressed(path: string): boolean {
+    const until = this.deleteEchoSuppressedUntil.get(path);
+    if (until === undefined) {
+      return false;
     }
-    let idx = path.indexOf("/");
-    while (idx !== -1) {
-      if (this.pendingDeletes.has(path.slice(0, idx))) {
-        return true;
-      }
-      idx = path.indexOf("/", idx + 1);
+    if (this.clock.now() >= until) {
+      this.deleteEchoSuppressedUntil.delete(path);
+      return false;
     }
-    return false;
+    return true;
   }
 
   private isPathSuppressed(path: string, checkDeleteEcho = false): boolean {
-    if (checkDeleteEcho) {
-      const until = this.deleteEchoSuppressedUntil.get(path);
-      if (until !== undefined) {
-        if (this.clock.now() < until) {
-          return true;
-        }
-        this.deleteEchoSuppressedUntil.delete(path);
-      }
-    }
-    if (this.suppressedPaths.has(path)) {
-      return true;
-    }
-    let idx = path.indexOf("/");
-    while (idx !== -1) {
-      if (this.suppressedPaths.has(path.slice(0, idx))) {
+    return this.hasPathOrAncestor(path, (candidate) => {
+      if (this.suppressedPaths.has(candidate)) {
         return true;
       }
-      idx = path.indexOf("/", idx + 1);
-    }
-    return false;
+      return checkDeleteEcho
+        ? this.isDeleteEchoSuppressed(candidate)
+        : this.isEchoSuppressed(candidate);
+    });
   }
 
   private async resolveUniqueConflictPath(
@@ -1025,7 +1156,7 @@ export class SyncPluginCore {
 
   onVaultRename(oldPath: string, newPath: string, type: "file" | "folder"): void {
     if (!this.data.credentials) return;
-    if (this.suppressedPaths.has(oldPath) || this.suppressedPaths.has(newPath)) {
+    if (this.isPathSuppressed(oldPath) || this.isPathSuppressed(newPath)) {
       return;
     }
     const oldExcluded = isExcludedPath(oldPath);
@@ -1077,6 +1208,7 @@ export class SyncPluginCore {
   async syncNow(): Promise<void> {
     this.clearDebounceTimer();
     await this.flushPendingPush();
+    await this.pullDelta();
   }
 
   private clearDebounceTimer(): void {
@@ -1222,19 +1354,7 @@ export class SyncPluginCore {
         };
 
         if (existing.type === "folder") {
-          const oldPrefix = `${oldPath}/`;
-          const newPrefix = `${newPath}/`;
-          for (const key of Object.keys(this.data.syncIndex)) {
-            if (key.startsWith(oldPrefix)) {
-              const childEntry = this.data.syncIndex[key];
-              const updatedKey = newPrefix + key.slice(oldPrefix.length);
-              delete this.data.syncIndex[key];
-              this.data.syncIndex[updatedKey] = {
-                ...childEntry,
-                path: updatedKey,
-              };
-            }
-          }
+          this.renameIndexedSubtree(this.data.syncIndex, oldPath, newPath);
         }
 
         this.pendingRenames.shift();
@@ -1265,13 +1385,7 @@ export class SyncPluginCore {
           const remoteMeta = await this.drive.getFileMetadata(existing.driveId);
           if (!remoteMeta || remoteMeta.trashed) {
             // Remote file was deleted/trashed before local edit synced: delete beats edit.
-            this.suppressDeleteEcho(path);
-            if (await this.vault.exists(path)) {
-              await this.withSuppressedPath(path, () => this.vault.remove(path));
-            }
-            delete this.data.syncIndex[path];
-            this.baselineHashes.delete(path);
-            this.pendingUpserts.delete(path);
+            await this.removeLocalFileDeletedOnRemote(path);
             continue;
           }
           const remoteChanged =
@@ -1294,9 +1408,7 @@ export class SyncPluginCore {
               this.pendingUpserts.delete(path);
               continue;
             }
-            const baselineHash = this.baselineHashes.get(path);
-            const localContentUnchanged =
-              baselineHash !== undefined && computeContentHash(data) === baselineHash;
+            const localContentUnchanged = this.isLocalContentUnchanged(path, data, existing);
             if (localContentUnchanged) {
               this.suppressEcho(path);
               const updatedStat = await this.withSuppressedPath(path, () =>
@@ -1340,26 +1452,14 @@ export class SyncPluginCore {
           });
         } catch (err) {
           if (existing && err instanceof DriveApiError && err.status === 404) {
-            this.suppressDeleteEcho(path);
-            if (await this.vault.exists(path)) {
-              await this.withSuppressedPath(path, () => this.vault.remove(path));
-            }
-            delete this.data.syncIndex[path];
-            this.baselineHashes.delete(path);
-            this.pendingUpserts.delete(path);
+            await this.removeLocalFileDeletedOnRemote(path);
             continue;
           }
           throw err;
         }
 
         if (existing && meta.trashed) {
-          this.suppressDeleteEcho(path);
-          if (await this.vault.exists(path)) {
-            await this.withSuppressedPath(path, () => this.vault.remove(path));
-          }
-          delete this.data.syncIndex[path];
-          this.baselineHashes.delete(path);
-          this.pendingUpserts.delete(path);
+          await this.removeLocalFileDeletedOnRemote(path);
           continue;
         }
 
