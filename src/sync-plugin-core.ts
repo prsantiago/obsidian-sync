@@ -1,4 +1,10 @@
 import { maskCredential, parseConfigBundle } from "./config-bundle";
+import {
+  buildConflictCandidatePath,
+  bytesEqual,
+  computeContentHash,
+  formatConflictTimestamp,
+} from "./conflict";
 import { DriveApiError, GoogleDriveClient, type DriveChange, type DriveFileMetadata } from "./drive-client";
 import { isExcludedPath, isGoogleWorkspaceNativeMime } from "./exclusions";
 import { OAuthTokenManager } from "./oauth-manager";
@@ -65,6 +71,7 @@ export class SyncPluginCore {
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private suppressedPaths = new Set<string>();
   private followUpRequested = false;
+  private readonly baselineHashes = new Map<string, string>();
 
   constructor(deps: SyncPluginCoreDeps) {
     this.vault = deps.vault;
@@ -285,6 +292,7 @@ export class SyncPluginCore {
           remoteModifiedTime: item.modifiedTime,
           type: "file",
         };
+        this.baselineHashes.set(relativePath, computeContentHash(content));
         syncIndex[relativePath] = fileEntry;
         byDriveId?.set(item.id, fileEntry);
       }
@@ -587,8 +595,55 @@ export class SyncPluginCore {
       }
 
       const content = await this.drive.downloadFile(file.id);
+      const localStat = await this.vault.stat(relativePath);
+      if (localStat && localStat.type === "file") {
+        const localModified =
+          !existing ||
+          localStat.mtime !== existing.localMtime ||
+          this.pendingUpserts.has(relativePath);
+        if (localModified) {
+          const localBytes = await this.vault.readBinary(relativePath);
+          const baselineHash = this.baselineHashes.get(relativePath);
+          const localContentUnchanged =
+            baselineHash !== undefined && computeContentHash(localBytes) === baselineHash;
+          if (!localContentUnchanged) {
+            if (bytesEqual(localBytes, content)) {
+              const convergedEntry: SyncIndexEntry = {
+                path: relativePath,
+                driveId: file.id,
+                parentId: parentId!,
+                md5Checksum: file.md5Checksum ?? null,
+                localMtime: localStat.mtime,
+                remoteModifiedTime: file.modifiedTime,
+                type: "file",
+              };
+              syncIndex[relativePath] = convergedEntry;
+              byDriveId.set(file.id, convergedEntry);
+              this.baselineHashes.set(relativePath, computeContentHash(localBytes));
+              this.pendingUpserts.delete(relativePath);
+              continue;
+            }
+
+            await this.resolveEditConflict({
+              path: relativePath,
+              parentId: parentId!,
+              driveId: file.id,
+              localBytes,
+              localMtime: localStat.mtime,
+              remoteBytes: content,
+              remoteMeta: file,
+              syncIndex,
+              byDriveId,
+            });
+            continue;
+          }
+        }
+      }
+
       this.suppressEcho(relativePath);
-      const stat = await this.vault.writeBinary(relativePath, content);
+      const stat = await this.withSuppressedPath(relativePath, () =>
+        this.vault.writeBinary(relativePath, content),
+      );
       const entry: SyncIndexEntry = {
         path: relativePath,
         driveId: file.id,
@@ -600,6 +655,7 @@ export class SyncPluginCore {
       };
       syncIndex[relativePath] = entry;
       byDriveId.set(file.id, entry);
+      this.baselineHashes.set(relativePath, computeContentHash(content));
     }
 
     this.data = {
@@ -666,6 +722,119 @@ export class SyncPluginCore {
       idx = path.indexOf("/", idx + 1);
     }
     return false;
+  }
+
+  private async resolveUniqueConflictPath(
+    originalPath: string,
+    syncIndex: Record<string, SyncIndexEntry>,
+  ): Promise<string> {
+    const timestampStr = formatConflictTimestamp(this.clock.now());
+    let attempt = 1;
+    while (true) {
+      const candidate = buildConflictCandidatePath(originalPath, timestampStr, attempt);
+      if (!(await this.vault.exists(candidate)) && !syncIndex[candidate]) {
+        return candidate;
+      }
+      attempt += 1;
+    }
+  }
+
+  private async resolveEditConflict(params: {
+    path: string;
+    parentId: string;
+    driveId: string;
+    localBytes: ArrayBuffer;
+    localMtime: number;
+    remoteBytes: ArrayBuffer;
+    remoteMeta: DriveFileMetadata;
+    syncIndex: Record<string, SyncIndexEntry>;
+    byDriveId?: Map<string, SyncIndexEntry>;
+  }): Promise<void> {
+    const {
+      path,
+      parentId,
+      driveId,
+      localBytes,
+      localMtime,
+      remoteBytes,
+      remoteMeta,
+      syncIndex,
+      byDriveId,
+    } = params;
+
+    const remoteMtimeMs = Date.parse(remoteMeta.modifiedTime) || 0;
+    const localIsNewer = localMtime >= remoteMtimeMs;
+    const conflictPath = await this.resolveUniqueConflictPath(path, syncIndex);
+
+    const slashCanonical = path.lastIndexOf("/");
+    const canonicalName = slashCanonical >= 0 ? path.slice(slashCanonical + 1) : path;
+    const slashConflict = conflictPath.lastIndexOf("/");
+    const conflictName = slashConflict >= 0 ? conflictPath.slice(slashConflict + 1) : conflictPath;
+
+    const olderBytes = localIsNewer ? remoteBytes : localBytes;
+
+    if (localIsNewer) {
+      const updatedCanonicalMeta = await this.drive.uploadFile({
+        fileId: driveId,
+        name: canonicalName,
+        parentId,
+        data: localBytes,
+      });
+      const canonicalEntry: SyncIndexEntry = {
+        path,
+        driveId: updatedCanonicalMeta.id,
+        parentId,
+        md5Checksum: updatedCanonicalMeta.md5Checksum ?? null,
+        localMtime,
+        remoteModifiedTime: updatedCanonicalMeta.modifiedTime,
+        type: "file",
+      };
+      syncIndex[path] = canonicalEntry;
+      byDriveId?.set(updatedCanonicalMeta.id, canonicalEntry);
+      this.baselineHashes.set(path, computeContentHash(localBytes));
+    } else {
+      this.suppressEcho(path);
+      const canonicalStat = await this.withSuppressedPath(path, () =>
+        this.vault.writeBinary(path, remoteBytes),
+      );
+      const canonicalEntry: SyncIndexEntry = {
+        path,
+        driveId,
+        parentId,
+        md5Checksum: remoteMeta.md5Checksum ?? null,
+        localMtime: canonicalStat.mtime,
+        remoteModifiedTime: remoteMeta.modifiedTime,
+        type: "file",
+      };
+      syncIndex[path] = canonicalEntry;
+      byDriveId?.set(driveId, canonicalEntry);
+      this.baselineHashes.set(path, computeContentHash(remoteBytes));
+    }
+
+    this.suppressEcho(conflictPath);
+    const conflictStat = await this.withSuppressedPath(conflictPath, () =>
+      this.vault.writeBinary(conflictPath, olderBytes),
+    );
+    const conflictDriveMeta = await this.drive.uploadFile({
+      name: conflictName,
+      parentId,
+      data: olderBytes,
+    });
+    const conflictEntry: SyncIndexEntry = {
+      path: conflictPath,
+      driveId: conflictDriveMeta.id,
+      parentId,
+      md5Checksum: conflictDriveMeta.md5Checksum ?? null,
+      localMtime: conflictStat.mtime,
+      remoteModifiedTime: conflictDriveMeta.modifiedTime,
+      type: "file",
+    };
+    syncIndex[conflictPath] = conflictEntry;
+    byDriveId?.set(conflictDriveMeta.id, conflictEntry);
+    this.baselineHashes.set(conflictPath, computeContentHash(olderBytes));
+
+    this.pendingUpserts.delete(path);
+    this.notice.show(`Sync conflict on "${path}". Saved older version as "${conflictPath}".`);
   }
 
   private async withSuppressedPath<T>(path: string, fn: () => Promise<T>): Promise<T> {
@@ -915,6 +1084,71 @@ export class SyncPluginCore {
       const parentId = await this.ensureDriveFolder(parentPath, creds.rootFolderId);
 
       const existing = this.data.syncIndex[path];
+      if (existing && existing.type === "file" && existing.driveId) {
+        const remoteMeta = await this.drive.getFileMetadata(existing.driveId);
+        if (!remoteMeta || remoteMeta.trashed) {
+          // Remote file was deleted/trashed before local edit synced: delete beats edit.
+          this.suppressDeleteEcho(path);
+          if (await this.vault.exists(path)) {
+            await this.withSuppressedPath(path, () => this.vault.remove(path));
+          }
+          delete this.data.syncIndex[path];
+          this.baselineHashes.delete(path);
+          continue;
+        }
+        const remoteChanged =
+          remoteMeta.md5Checksum && existing.md5Checksum
+            ? remoteMeta.md5Checksum !== existing.md5Checksum
+            : remoteMeta.modifiedTime !== existing.remoteModifiedTime;
+        if (remoteChanged) {
+          const remoteBytes = await this.drive.downloadFile(existing.driveId);
+          if (bytesEqual(data, remoteBytes)) {
+            this.data.syncIndex[path] = {
+              path,
+              driveId: existing.driveId,
+              parentId,
+              md5Checksum: remoteMeta.md5Checksum ?? null,
+              localMtime: stat.mtime,
+              remoteModifiedTime: remoteMeta.modifiedTime,
+              type: "file",
+            };
+            this.baselineHashes.set(path, computeContentHash(data));
+            continue;
+          }
+          const baselineHash = this.baselineHashes.get(path);
+          const localContentUnchanged =
+            baselineHash !== undefined && computeContentHash(data) === baselineHash;
+          if (localContentUnchanged) {
+            this.suppressEcho(path);
+            const updatedStat = await this.withSuppressedPath(path, () =>
+              this.vault.writeBinary(path, remoteBytes),
+            );
+            this.data.syncIndex[path] = {
+              path,
+              driveId: existing.driveId,
+              parentId,
+              md5Checksum: remoteMeta.md5Checksum ?? null,
+              localMtime: updatedStat.mtime,
+              remoteModifiedTime: remoteMeta.modifiedTime,
+              type: "file",
+            };
+            this.baselineHashes.set(path, computeContentHash(remoteBytes));
+            continue;
+          }
+          await this.resolveEditConflict({
+            path,
+            parentId,
+            driveId: existing.driveId,
+            localBytes: data,
+            localMtime: stat.mtime,
+            remoteBytes,
+            remoteMeta,
+            syncIndex: this.data.syncIndex,
+          });
+          continue;
+        }
+      }
+
       let meta: DriveFileMetadata;
       try {
         meta = await this.drive.uploadFile({
@@ -925,23 +1159,24 @@ export class SyncPluginCore {
         });
       } catch (err) {
         if (existing && err instanceof DriveApiError && err.status === 404) {
-          // Remote file was deleted/trashed before local edit synced: delete beats edit.
-          this.suppressEcho(path);
+          this.suppressDeleteEcho(path);
           if (await this.vault.exists(path)) {
             await this.withSuppressedPath(path, () => this.vault.remove(path));
           }
           delete this.data.syncIndex[path];
+          this.baselineHashes.delete(path);
           continue;
         }
         throw err;
       }
 
       if (existing && meta.trashed) {
-        this.suppressEcho(path);
+        this.suppressDeleteEcho(path);
         if (await this.vault.exists(path)) {
           await this.withSuppressedPath(path, () => this.vault.remove(path));
         }
         delete this.data.syncIndex[path];
+        this.baselineHashes.delete(path);
         continue;
       }
 
@@ -954,6 +1189,7 @@ export class SyncPluginCore {
         remoteModifiedTime: meta.modifiedTime,
         type: "file",
       };
+      this.baselineHashes.set(path, computeContentHash(data));
     }
 
     await this.vault.savePluginData(this.data);
