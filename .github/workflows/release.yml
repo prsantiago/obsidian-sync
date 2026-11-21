@@ -1,0 +1,72 @@
+name: Release Obsidian Plugin (BRAT)
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Run test suite
+        run: npm test
+
+      - name: Build production plugin bundle
+        run: npm run build
+
+      - name: Verify tag matches manifest.json, package.json, and versions.json
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const tag = process.env.GITHUB_REF_NAME.replace(/^v/, "");
+            const manifest = JSON.parse(fs.readFileSync("manifest.json", "utf8"));
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            const versions = JSON.parse(fs.readFileSync("versions.json", "utf8"));
+            if (manifest.version !== tag) {
+              throw new Error(`Tag ${tag} does not match manifest.json version ${manifest.version}`);
+            }
+            if (pkg.version !== tag) {
+              throw new Error(`Tag ${tag} does not match package.json version ${pkg.version}`);
+            }
+            if (versions[tag] !== manifest.minAppVersion) {
+              throw new Error(`versions.json[${tag}] (${versions[tag]}) does not match manifest.minAppVersion (${manifest.minAppVersion})`);
+            }
+            if (manifest.isDesktopOnly !== false) {
+              throw new Error("manifest.json must have isDesktopOnly: false");
+            }
+            for (const asset of ["main.js", "manifest.json", "styles.css"]) {
+              if (!fs.existsSync(asset)) {
+                throw new Error(`Missing required BRAT release asset: ${asset}`);
+              }
+            }
+            console.log(`Verified release ${tag} assets and metadata.`);
+          '
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            main.js
+            manifest.json
+            styles.css

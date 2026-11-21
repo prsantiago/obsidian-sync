@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "feat/**"
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Run test suite
+        run: npm test
+
+      - name: Build production plugin bundle
+        run: npm run build
+
+      - name: Verify zero Node.js built-ins in main.js
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const bundle = fs.readFileSync("main.js", "utf8");
+            const builtins = ["fs", "path", "http", "https", "crypto", "child_process", "os", "stream", "buffer", "util", "net", "tls", "url", "readline"];
+            for (const mod of builtins) {
+              const re = new RegExp("require\\([\"'\''](?:node:)?" + mod + "(?:/[^\"'\'']*)?[\"'\'']\\)");
+              if (re.test(bundle)) {
+                console.error("Found forbidden Node.js built-in in main.js:", mod);
+                process.exit(1);
+              }
+            }
+            console.log("Verified zero Node.js built-ins in main.js");
+          '
