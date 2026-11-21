@@ -93,6 +93,39 @@ export class GoogleDriveSyncSettingTab extends PluginSettingTab {
             });
         });
     }
+
+    // Bounded Sync Error Log
+    containerEl.createEl("h3", { text: "Sync Error Log" });
+    const errorLog = this.core.getErrorLog();
+    if (errorLog.length === 0) {
+      containerEl.createEl("p", {
+        cls: "setting-item-description",
+        text: "No sync errors recorded.",
+      });
+    } else {
+      new Setting(containerEl)
+        .setName("Recent sync errors")
+        .setDesc(`Showing ${errorLog.length} recorded error(s) (max 50).`)
+        .addButton((btn) => {
+          btn.setButtonText("Clear log").onClick(async () => {
+            await this.core.clearErrorLog();
+            this.display();
+          });
+        });
+
+      const listEl = containerEl.createDiv({ cls: "gdrive-sync-error-log" });
+      for (const entry of [...errorLog].reverse()) {
+        const itemEl = listEl.createDiv({ cls: "gdrive-sync-error-log-entry" });
+        itemEl.createSpan({
+          cls: "gdrive-sync-error-log-time",
+          text: `${new Date(entry.timestamp).toISOString()} — `,
+        });
+        itemEl.createSpan({
+          cls: "gdrive-sync-error-log-msg",
+          text: entry.message,
+        });
+      }
+    }
   }
 
   private addStatusRow(parent: HTMLElement, label: string, value: string): void {
