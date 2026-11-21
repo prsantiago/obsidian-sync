@@ -57,6 +57,69 @@ export class InMemoryVaultPort implements VaultPort {
     return entry.data.slice().buffer;
   }
 
+  async rename(oldPath: string, newPath: string): Promise<void> {
+    const oldNorm = this.normalizePath(oldPath);
+    const newNorm = this.normalizePath(newPath);
+    if (oldNorm === newNorm) return;
+
+    const newParent = newNorm.includes("/") ? newNorm.slice(0, newNorm.lastIndexOf("/")) : "";
+    if (newParent) {
+      await this.mkdir(newParent);
+    }
+
+    const file = this.files.get(oldNorm);
+    if (file) {
+      this.files.delete(oldNorm);
+      this.files.set(newNorm, file);
+      return;
+    }
+
+    if (this.folders.has(oldNorm)) {
+      this.folders.delete(oldNorm);
+      this.folders.add(newNorm);
+
+      const oldPrefix = `${oldNorm}/`;
+      for (const folderPath of Array.from(this.folders)) {
+        if (folderPath.startsWith(oldPrefix)) {
+          this.folders.delete(folderPath);
+          this.folders.add(`${newNorm}/${folderPath.slice(oldPrefix.length)}`);
+        }
+      }
+      for (const [filePath, stored] of Array.from(this.files.entries())) {
+        if (filePath.startsWith(oldPrefix)) {
+          this.files.delete(filePath);
+          this.files.set(`${newNorm}/${filePath.slice(oldPrefix.length)}`, stored);
+        }
+      }
+      return;
+    }
+
+    throw new Error(`Path not found in vault: ${oldNorm}`);
+  }
+
+  async remove(path: string): Promise<void> {
+    const norm = this.normalizePath(path);
+    this.files.delete(norm);
+  }
+
+  async rmdir(path: string, recursive: boolean): Promise<void> {
+    const norm = this.normalizePath(path);
+    this.folders.delete(norm);
+    if (recursive) {
+      const prefix = `${norm}/`;
+      for (const folderPath of Array.from(this.folders)) {
+        if (folderPath.startsWith(prefix)) {
+          this.folders.delete(folderPath);
+        }
+      }
+      for (const filePath of Array.from(this.files.keys())) {
+        if (filePath.startsWith(prefix)) {
+          this.files.delete(filePath);
+        }
+      }
+    }
+  }
+
   async stat(path: string): Promise<VaultStat | null> {
     const norm = this.normalizePath(path);
     const file = this.files.get(norm);

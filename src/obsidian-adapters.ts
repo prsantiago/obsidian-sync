@@ -48,6 +48,22 @@ export class ObsidianVaultAdapter implements VaultPort {
     return this.adapter.readBinary(path);
   }
 
+  async rename(oldPath: string, newPath: string): Promise<void> {
+    const parent = newPath.includes("/") ? newPath.slice(0, newPath.lastIndexOf("/")) : "";
+    if (parent && !(await this.adapter.exists(parent))) {
+      await this.adapter.mkdir(parent);
+    }
+    await this.adapter.rename(oldPath, newPath);
+  }
+
+  async remove(path: string): Promise<void> {
+    await this.adapter.remove(path);
+  }
+
+  async rmdir(path: string, recursive: boolean): Promise<void> {
+    await this.adapter.rmdir(path, recursive);
+  }
+
   async stat(path: string): Promise<VaultStat | null> {
     const st = await this.adapter.stat(path);
     if (!st) return null;

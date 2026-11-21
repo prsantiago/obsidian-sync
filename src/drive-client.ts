@@ -9,6 +9,18 @@ export interface DriveFileMetadata {
   md5Checksum?: string;
   modifiedTime: string;
   size?: string;
+  trashed?: boolean;
+}
+
+export interface DriveChange {
+  fileId: string;
+  removed?: boolean;
+  file?: DriveFileMetadata;
+}
+
+export interface DriveChangesResult {
+  changes: DriveChange[];
+  newStartPageToken: string;
 }
 
 export class DriveApiError extends Error {
@@ -111,5 +123,86 @@ export class GoogleDriveClient {
     }
 
     return body.startPageToken;
+  }
+
+  /**
+   * Lists incremental Drive changes starting from `startPageToken`, handling pagination.
+   */
+  async listChanges(startPageToken: string): Promise<DriveChangesResult> {
+    const changes: DriveChange[] = [];
+    let pageToken: string | undefined = startPageToken;
+    let newStartPageToken: string | undefined;
+
+    while (pageToken) {
+      const params = new URLSearchParams({
+        pageToken,
+        fields:
+          "nextPageToken, newStartPageToken, changes(fileId, removed, file(id, name, mimeType, parents, md5Checksum, modifiedTime, size, trashed))",
+        pageSize: "1000",
+        supportsAllDrives: "true",
+        includeItemsFromAllDrives: "true",
+        includeRemoved: "true",
+        spaces: "drive",
+      });
+
+      const res = await this.auth.authorizedRequest({
+        url: `${GOOGLE_DRIVE_API_BASE}/changes?${params.toString()}`,
+        method: "GET",
+      });
+
+      if (res.status < 200 || res.status >= 300) {
+        throw new DriveApiError(res.status, `Drive changes.list failed (${res.status}): ${res.text}`);
+      }
+
+      const body = res.json as {
+        nextPageToken?: string;
+        newStartPageToken?: string;
+        changes?: DriveChange[];
+      };
+
+      if (Array.isArray(body.changes)) {
+        changes.push(...body.changes);
+      }
+
+      if (body.nextPageToken) {
+        pageToken = body.nextPageToken;
+      } else {
+        newStartPageToken = body.newStartPageToken ?? pageToken;
+        pageToken = undefined;
+      }
+    }
+
+    return {
+      changes,
+      newStartPageToken: newStartPageToken ?? startPageToken,
+    };
+  }
+
+  /**
+   * Fetches metadata for a single Drive file or folder. Returns null on 404.
+   */
+  async getFileMetadata(fileId: string): Promise<DriveFileMetadata | null> {
+    const params = new URLSearchParams({
+      fields: "id, name, mimeType, parents, md5Checksum, modifiedTime, size, trashed",
+      supportsAllDrives: "true",
+    });
+
+    const res = await this.auth.authorizedRequest({
+      url: `${GOOGLE_DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}?${params.toString()}`,
+      method: "GET",
+    });
+
+    if (res.status === 404) {
+      return null;
+    }
+
+    if (res.status < 200 || res.status >= 300) {
+      throw new DriveApiError(
+        res.status,
+        `Drive files.get metadata (${fileId}) failed (${res.status}): ${res.text}`,
+      );
+    }
+
+    return res.json as DriveFileMetadata;
   }
 }
