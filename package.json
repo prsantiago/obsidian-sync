@@ -8,7 +8,8 @@
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
     "typecheck": "tsc -noEmit -skipLibCheck",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "setup": "esbuild cli/oauth-setup.ts --bundle --platform=node --format=esm --outfile=dist/oauth-setup.mjs && node dist/oauth-setup.mjs"
   },
   "keywords": [
     "obsidian",
