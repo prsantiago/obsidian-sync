@@ -17,6 +17,16 @@ export class TerminalAuthError extends Error {
   }
 }
 
+export class OAuthRefreshError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "OAuthRefreshError";
+    this.status = status;
+  }
+}
+
 export class OAuthTokenManager {
   private readonly http: HttpTransport;
   private readonly notice: NoticeSink;
@@ -141,7 +151,8 @@ export class OAuthTokenManager {
       throw new TerminalAuthError(msg);
     }
 
-    throw new Error(
+    throw new OAuthRefreshError(
+      response.status,
       `OAuth token refresh failed with HTTP ${response.status}: ${errPayload.error ?? response.text}`,
     );
   }

@@ -1,7 +1,7 @@
 import { maskCredential, parseConfigBundle } from "./config-bundle";
 import { DriveApiError, GoogleDriveClient, type DriveChange, type DriveFileMetadata } from "./drive-client";
 import { isExcludedPath, isGoogleWorkspaceNativeMime } from "./exclusions";
-import { OAuthTokenManager } from "./oauth-manager";
+import { OAuthRefreshError, OAuthTokenManager, TerminalAuthError } from "./oauth-manager";
 import {
   GOOGLE_FOLDER_MIME,
   PUSH_DEBOUNCE_MS,
@@ -10,7 +10,10 @@ import {
   type HttpTransport,
   type NoticeSink,
   type OAuthCredentials,
+  type PendingQueue,
+  type PendingRename,
   type PluginData,
+  type SyncErrorLogEntry,
   type SyncIndexEntry,
   type VaultPort,
 } from "./types";
@@ -20,6 +23,13 @@ export interface SyncPluginCoreDeps {
   http: HttpTransport;
   notice: NoticeSink;
   clock?: Clock;
+  isOnline?: () => boolean;
+  sleep?: (ms: number) => Promise<void>;
+  retryDelaysMs?: number[];
+}
+
+function emptyPendingQueue(): PendingQueue {
+  return { upserts: [], renames: [] };
 }
 
 function emptyPluginData(): PluginData {
@@ -27,6 +37,8 @@ function emptyPluginData(): PluginData {
     credentials: null,
     syncIndex: {},
     startPageToken: null,
+    pendingQueue: emptyPendingQueue(),
+    errorLog: [],
   };
 }
 
@@ -35,20 +47,32 @@ function normalizePluginData(raw: unknown): PluginData {
     return emptyPluginData();
   }
   const rec = raw as Partial<PluginData>;
+  const rawQueue = rec.pendingQueue;
   return {
     credentials: rec.credentials ?? null,
     syncIndex: rec.syncIndex ?? {},
     startPageToken: rec.startPageToken ?? null,
+    pendingQueue: {
+      upserts: Array.isArray(rawQueue?.upserts) ? rawQueue.upserts : [],
+      renames: Array.isArray(rawQueue?.renames) ? rawQueue.renames : [],
+    },
+    errorLog: Array.isArray(rec.errorLog) ? rec.errorLog : [],
   };
 }
 
 const POLL_INTERVAL_MS = 30_000;
 const ECHO_SUPPRESSION_WINDOW_MS = 2_000;
+const DEFAULT_RETRY_DELAYS_MS = [1_000, 2_000, 4_000];
+const ERROR_NOTICE_DURATION_MS = 8_000;
+const MAX_ERROR_LOG_ENTRIES = 50;
 
 export class SyncPluginCore {
   private readonly vault: VaultPort;
   private readonly notice: NoticeSink;
   private readonly clock: Clock;
+  private readonly isOnline: () => boolean;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly retryDelaysMs: number[];
   private readonly auth: OAuthTokenManager;
   private readonly drive: GoogleDriveClient;
   private data: PluginData = emptyPluginData();
@@ -57,9 +81,11 @@ export class SyncPluginCore {
   private syncChain: Promise<void> = Promise.resolve();
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private isVisible = true;
+  private authHalted = false;
+  private disposed = false;
   private readonly echoSuppressedUntil = new Map<string, number>();
   private pendingUpserts = new Map<string, "file" | "folder">();
-  private pendingRenames: Array<{ oldPath: string; newPath: string; type: "file" | "folder" }> = [];
+  private pendingRenames: PendingRename[] = [];
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private suppressedPaths = new Set<string>();
   private followUpRequested = false;
@@ -68,6 +94,15 @@ export class SyncPluginCore {
     this.vault = deps.vault;
     this.notice = deps.notice;
     this.clock = deps.clock ?? { now: () => Date.now() };
+    this.isOnline =
+      deps.isOnline ??
+      (() =>
+        typeof navigator !== "undefined" && typeof navigator.onLine === "boolean"
+          ? navigator.onLine
+          : true);
+    this.sleep =
+      deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.retryDelaysMs = deps.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS;
     this.auth = new OAuthTokenManager({
       http: deps.http,
       notice: deps.notice,
@@ -84,15 +119,20 @@ export class SyncPluginCore {
   async load(): Promise<void> {
     const raw = await this.vault.loadPluginData();
     this.data = normalizePluginData(raw);
+    this.restorePendingQueueFromData();
     if (this.data.credentials) {
       if (this.isVisible) {
         this.startPolling();
       }
-      await this.pullDelta();
+      if (this.isOnline()) {
+        await this.flushPendingPush();
+        await this.pullDelta();
+      }
     }
   }
 
   unload(): void {
+    this.disposed = true;
     this.stopPolling();
     this.clearDebounceTimer();
   }
@@ -135,15 +175,58 @@ export class SyncPluginCore {
     }
   }
 
+  async handleOnline(): Promise<void> {
+    if (!this.data.credentials || !this.isOnline()) {
+      return;
+    }
+    this.clearDebounceTimer();
+    await this.flushPendingPush();
+    await this.pullDelta();
+  }
+
+  getErrorLog(): SyncErrorLogEntry[] {
+    return [...(this.data.errorLog ?? [])];
+  }
+
+  async clearErrorLog(): Promise<void> {
+    this.data = { ...this.data, errorLog: [] };
+    await this.vault.savePluginData(this.data);
+  }
+
+  private restorePendingQueueFromData(): void {
+    this.pendingUpserts.clear();
+    this.pendingRenames = [];
+    const queue = this.data.pendingQueue;
+    if (!queue) return;
+    for (const item of queue.upserts) {
+      this.pendingUpserts.set(item.path, item.type);
+    }
+    for (const rename of queue.renames) {
+      this.pendingRenames.push({ ...rename });
+    }
+  }
+
+  private syncPendingQueueToData(): void {
+    this.data = {
+      ...this.data,
+      pendingQueue: {
+        upserts: Array.from(this.pendingUpserts.entries()).map(([path, type]) => ({ path, type })),
+        renames: this.pendingRenames.map((r) => ({ ...r })),
+      },
+    };
+  }
+
+  private persistPendingQueue(): void {
+    this.syncPendingQueueToData();
+    void this.vault.savePluginData(this.data);
+  }
+
   private startPolling(): void {
-    if (this.pollTimer !== null || !this.data.credentials || !this.isVisible) {
+    if (this.pollTimer !== null || !this.data.credentials || !this.isVisible || this.authHalted) {
       return;
     }
     this.pollTimer = setInterval(() => {
-      void this.pullDelta().catch((err) => {
-        const message = err instanceof Error ? err.message : String(err);
-        this.notice.show(`Google Drive sync failed: ${message}`);
-      });
+      void this.pullDelta();
     }, POLL_INTERVAL_MS);
   }
 
@@ -176,13 +259,25 @@ export class SyncPluginCore {
 
   async importConfigBundle(rawBundle: string): Promise<void> {
     const bundle = parseConfigBundle(rawBundle);
+    this.authHalted = false;
     this.data = {
       credentials: { ...bundle },
       syncIndex: {},
       startPageToken: null,
+      pendingQueue: emptyPendingQueue(),
+      errorLog: this.data.errorLog ?? [],
     };
     await this.vault.savePluginData(this.data);
-    await this.initialPull();
+    try {
+      await this.initialPull();
+    } catch (err) {
+      if (err instanceof TerminalAuthError) {
+        this.authHalted = true;
+        this.stopPolling();
+        await this.appendErrorLog(err.message, "invalid_grant");
+      }
+      throw err;
+    }
     if (this.isVisible) {
       this.startPolling();
     }
@@ -190,6 +285,9 @@ export class SyncPluginCore {
 
   async disconnect(): Promise<void> {
     this.stopPolling();
+    this.authHalted = false;
+    this.pendingUpserts.clear();
+    this.pendingRenames = [];
     this.data = emptyPluginData();
     await this.vault.savePluginData(this.data);
   }
@@ -289,18 +387,71 @@ export class SyncPluginCore {
     return next;
   }
 
+  private async appendErrorLog(message: string, code?: string): Promise<void> {
+    const entry: SyncErrorLogEntry = {
+      timestamp: this.clock.now(),
+      message,
+      ...(code ? { code } : {}),
+    };
+    const nextLog = [...(this.data.errorLog ?? []), entry].slice(-MAX_ERROR_LOG_ENTRIES);
+    this.data = { ...this.data, errorLog: nextLog };
+    await this.vault.savePluginData(this.data);
+  }
+
+  private isTransientError(err: unknown): boolean {
+    if (err instanceof TerminalAuthError) {
+      return false;
+    }
+    if (err instanceof DriveApiError || err instanceof OAuthRefreshError) {
+      return err.status === 429 || (err.status >= 500 && err.status < 600);
+    }
+    return true;
+  }
+
+  private async runWithRetryAndErrorHandling(operation: () => Promise<void>): Promise<void> {
+    for (let attempt = 0; attempt <= this.retryDelaysMs.length; attempt += 1) {
+      if (this.disposed || !this.data.credentials || !this.isOnline() || this.authHalted) {
+        return;
+      }
+      try {
+        await operation();
+        return;
+      } catch (err) {
+        if (err instanceof TerminalAuthError) {
+          this.authHalted = true;
+          this.stopPolling();
+          await this.appendErrorLog(err.message, "invalid_grant");
+          return;
+        }
+        if (this.disposed || !this.isOnline()) {
+          return;
+        }
+        if (this.isTransientError(err) && attempt < this.retryDelaysMs.length) {
+          await this.sleep(this.retryDelaysMs[attempt]);
+          continue;
+        }
+        const message = err instanceof Error ? err.message : String(err);
+        await this.appendErrorLog(message);
+        this.notice.show(`Google Drive sync failed: ${message}`, ERROR_NOTICE_DURATION_MS);
+        return;
+      }
+    }
+  }
+
   /**
    * Pulls incremental remote changes using Google Drive's `changes.list` API.
    * Coalesces concurrent calls into a single in-flight pull, serialized with pushes.
    */
   async pullDelta(): Promise<void> {
-    if (!this.data.credentials) {
+    if (!this.data.credentials || !this.isOnline() || this.authHalted) {
       return;
     }
     if (this.pullInFlight) {
       return this.pullInFlight;
     }
-    this.pullInFlight = this.enqueueSync(() => this.executePullDelta()).finally(() => {
+    this.pullInFlight = this.enqueueSync(() =>
+      this.runWithRetryAndErrorHandling(() => this.executePullDelta()),
+    ).finally(() => {
       this.pullInFlight = null;
     });
     return this.pullInFlight;
@@ -622,6 +773,7 @@ export class SyncPluginCore {
       return;
     }
     this.pendingUpserts.set(path, type);
+    this.persistPendingQueue();
     this.schedulePushDebounce();
   }
 
@@ -630,6 +782,7 @@ export class SyncPluginCore {
       return;
     }
     this.pendingUpserts.set(path, "file");
+    this.persistPendingQueue();
     this.schedulePushDebounce();
   }
 
@@ -643,11 +796,13 @@ export class SyncPluginCore {
     if (oldExcluded && newExcluded) return;
     if (oldExcluded && !newExcluded) {
       this.pendingUpserts.set(newPath, type);
+      this.persistPendingQueue();
       this.schedulePushDebounce();
       return;
     }
     if (!oldExcluded && newExcluded) {
       this.pendingUpserts.delete(oldPath);
+      this.persistPendingQueue();
       return;
     }
 
@@ -658,11 +813,14 @@ export class SyncPluginCore {
     }
 
     this.pendingRenames.push({ oldPath, newPath, type });
+    this.persistPendingQueue();
     this.schedulePushDebounce();
   }
 
   onVaultDelete(path: string): void {
-    this.pendingUpserts.delete(path);
+    if (this.pendingUpserts.delete(path)) {
+      this.persistPendingQueue();
+    }
   }
 
   async onVisibilityHidden(): Promise<void> {
@@ -723,22 +881,30 @@ export class SyncPluginCore {
   }
 
   async flushPendingPush(): Promise<void> {
+    if (!this.data.credentials || !this.isOnline() || this.authHalted) {
+      return;
+    }
     if (this.pushInFlight) {
       this.followUpRequested = true;
       await this.pushInFlight;
       return;
     }
 
-    this.pushInFlight = this.enqueueSync(async () => {
-      do {
-        this.followUpRequested = false;
-        await this.runFlushOnce();
-      } while (
-        this.followUpRequested ||
-        this.pendingUpserts.size > 0 ||
-        this.pendingRenames.length > 0
-      );
-    }).finally(() => {
+    this.pushInFlight = this.enqueueSync(() =>
+      this.runWithRetryAndErrorHandling(async () => {
+        do {
+          this.followUpRequested = false;
+          if (!this.isOnline() || this.authHalted) break;
+          await this.runFlushOnce();
+        } while (
+          this.isOnline() &&
+          !this.authHalted &&
+          (this.followUpRequested ||
+            this.pendingUpserts.size > 0 ||
+            this.pendingRenames.length > 0)
+        );
+      }),
+    ).finally(() => {
       this.pushInFlight = null;
     });
 
@@ -749,90 +915,99 @@ export class SyncPluginCore {
     const creds = this.data.credentials;
     if (!creds || (this.pendingUpserts.size === 0 && this.pendingRenames.length === 0)) return;
 
-    const renames = this.pendingRenames.splice(0, this.pendingRenames.length);
-    for (const { oldPath, newPath, type } of renames) {
-      const existing = this.data.syncIndex[oldPath];
-      if (!existing) {
-        // Not yet tracked on Drive — upload as a new item if it exists locally
-        this.pendingUpserts.set(newPath, type);
-        continue;
-      }
+    try {
+      while (this.pendingRenames.length > 0) {
+        const { oldPath, newPath, type } = this.pendingRenames[0];
+        const existing = this.data.syncIndex[oldPath];
+        if (!existing) {
+          // Not yet tracked on Drive — upload as a new item if it exists locally
+          this.pendingRenames.shift();
+          this.pendingUpserts.set(newPath, type);
+          continue;
+        }
 
-      const slashIdx = newPath.lastIndexOf("/");
-      const newParentPath = slashIdx >= 0 ? newPath.slice(0, slashIdx) : "";
-      const newName = slashIdx >= 0 ? newPath.slice(slashIdx + 1) : newPath;
-      const newParentId = await this.ensureDriveFolder(newParentPath, creds.rootFolderId);
+        const slashIdx = newPath.lastIndexOf("/");
+        const newParentPath = slashIdx >= 0 ? newPath.slice(0, slashIdx) : "";
+        const newName = slashIdx >= 0 ? newPath.slice(slashIdx + 1) : newPath;
+        const newParentId = await this.ensureDriveFolder(newParentPath, creds.rootFolderId);
 
-      const meta = await this.drive.renameOrMoveFile({
-        fileId: existing.driveId,
-        newName,
-        ...(newParentId !== existing.parentId
-          ? { addParentId: newParentId, removeParentId: existing.parentId }
-          : {}),
-      });
+        const meta = await this.drive.renameOrMoveFile({
+          fileId: existing.driveId,
+          newName,
+          ...(newParentId !== existing.parentId
+            ? { addParentId: newParentId, removeParentId: existing.parentId }
+            : {}),
+        });
 
-      delete this.data.syncIndex[oldPath];
-      this.data.syncIndex[newPath] = {
-        ...existing,
-        path: newPath,
-        parentId: newParentId,
-        remoteModifiedTime: meta.modifiedTime,
-      };
+        delete this.data.syncIndex[oldPath];
+        this.data.syncIndex[newPath] = {
+          ...existing,
+          path: newPath,
+          parentId: newParentId,
+          remoteModifiedTime: meta.modifiedTime,
+        };
 
-      if (existing.type === "folder") {
-        const oldPrefix = `${oldPath}/`;
-        const newPrefix = `${newPath}/`;
-        for (const key of Object.keys(this.data.syncIndex)) {
-          if (key.startsWith(oldPrefix)) {
-            const childEntry = this.data.syncIndex[key];
-            const updatedKey = newPrefix + key.slice(oldPrefix.length);
-            delete this.data.syncIndex[key];
-            this.data.syncIndex[updatedKey] = {
-              ...childEntry,
-              path: updatedKey,
-            };
+        if (existing.type === "folder") {
+          const oldPrefix = `${oldPath}/`;
+          const newPrefix = `${newPath}/`;
+          for (const key of Object.keys(this.data.syncIndex)) {
+            if (key.startsWith(oldPrefix)) {
+              const childEntry = this.data.syncIndex[key];
+              const updatedKey = newPrefix + key.slice(oldPrefix.length);
+              delete this.data.syncIndex[key];
+              this.data.syncIndex[updatedKey] = {
+                ...childEntry,
+                path: updatedKey,
+              };
+            }
           }
         }
-      }
-    }
 
-    const batch = Array.from(this.pendingUpserts.entries());
-    this.pendingUpserts.clear();
-
-    for (const [path, type] of batch) {
-      const stat = await this.vault.stat(path);
-      if (!stat) continue;
-
-      if (type === "folder" || stat.type === "folder") {
-        await this.ensureDriveFolder(path, creds.rootFolderId);
-        continue;
+        this.pendingRenames.shift();
       }
 
-      const data = await this.vault.readBinary(path);
-      const slashIdx = path.lastIndexOf("/");
-      const parentPath = slashIdx >= 0 ? path.slice(0, slashIdx) : "";
-      const name = slashIdx >= 0 ? path.slice(slashIdx + 1) : path;
-      const parentId = await this.ensureDriveFolder(parentPath, creds.rootFolderId);
+      const batch = Array.from(this.pendingUpserts.entries());
+      for (const [path, type] of batch) {
+        const stat = await this.vault.stat(path);
+        if (!stat) {
+          this.pendingUpserts.delete(path);
+          continue;
+        }
 
-      const existing = this.data.syncIndex[path];
-      const meta = await this.drive.uploadFile({
-        fileId: existing?.driveId,
-        name,
-        parentId,
-        data,
-      });
+        if (type === "folder" || stat.type === "folder") {
+          await this.ensureDriveFolder(path, creds.rootFolderId);
+          this.pendingUpserts.delete(path);
+          continue;
+        }
 
-      this.data.syncIndex[path] = {
-        path,
-        driveId: meta.id,
-        parentId,
-        md5Checksum: meta.md5Checksum ?? null,
-        localMtime: stat.mtime,
-        remoteModifiedTime: meta.modifiedTime,
-        type: "file",
-      };
+        const data = await this.vault.readBinary(path);
+        const slashIdx = path.lastIndexOf("/");
+        const parentPath = slashIdx >= 0 ? path.slice(0, slashIdx) : "";
+        const name = slashIdx >= 0 ? path.slice(slashIdx + 1) : path;
+        const parentId = await this.ensureDriveFolder(parentPath, creds.rootFolderId);
+
+        const existing = this.data.syncIndex[path];
+        const meta = await this.drive.uploadFile({
+          fileId: existing?.driveId,
+          name,
+          parentId,
+          data,
+        });
+
+        this.data.syncIndex[path] = {
+          path,
+          driveId: meta.id,
+          parentId,
+          md5Checksum: meta.md5Checksum ?? null,
+          localMtime: stat.mtime,
+          remoteModifiedTime: meta.modifiedTime,
+          type: "file",
+        };
+        this.pendingUpserts.delete(path);
+      }
+    } finally {
+      this.syncPendingQueueToData();
+      await this.vault.savePluginData(this.data);
     }
-
-    await this.vault.savePluginData(this.data);
   }
 }

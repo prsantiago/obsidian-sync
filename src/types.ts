@@ -21,10 +21,34 @@ export interface SyncIndexEntry {
   type: "file" | "folder";
 }
 
+export interface PendingUpsert {
+  path: string;
+  type: "file" | "folder";
+}
+
+export interface PendingRename {
+  oldPath: string;
+  newPath: string;
+  type: "file" | "folder";
+}
+
+export interface PendingQueue {
+  upserts: PendingUpsert[];
+  renames: PendingRename[];
+}
+
+export interface SyncErrorLogEntry {
+  timestamp: number;
+  message: string;
+  code?: string;
+}
+
 export interface PluginData {
   credentials: OAuthCredentials | null;
   syncIndex: Record<string, SyncIndexEntry>;
   startPageToken: string | null;
+  pendingQueue?: PendingQueue;
+  errorLog?: SyncErrorLogEntry[];
 }
 
 export interface ConnectionInfo {

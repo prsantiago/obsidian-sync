@@ -34,6 +34,12 @@ export default class GoogleDriveSyncPlugin extends Plugin {
       });
     }
 
+    if (typeof window !== "undefined") {
+      this.registerDomEvent(window, "online", () => {
+        void this.core.handleOnline();
+      });
+    }
+
     this.app.workspace.onLayoutReady(() => {
       this.registerEvent(
         this.app.vault.on("create", (file) => {
