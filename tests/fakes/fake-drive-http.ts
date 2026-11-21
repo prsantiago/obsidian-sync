@@ -38,6 +38,8 @@ export class FakeGoogleDriveHttp implements HttpTransport {
   public validClientId = "test-client-id";
   public validClientSecret = "test-client-secret";
   public validRefreshToken = "test-refresh-token";
+  public validAuthCode = "test-auth-code";
+  public omitRefreshTokenOnCodeExchange = false;
   public revokedRefreshToken = false;
   public forceNextDrive401 = false;
   public defaultPageSize = 1000;
@@ -182,6 +184,33 @@ export class FakeGoogleDriveHttp implements HttpTransport {
     const refreshToken = form.get("refresh_token");
     const grantType = form.get("grant_type");
 
+    if (grantType === "authorization_code") {
+      const code = form.get("code");
+      const redirectUri = form.get("redirect_uri");
+      if (
+        !redirectUri ||
+        clientId !== this.validClientId ||
+        clientSecret !== this.validClientSecret ||
+        code !== this.validAuthCode
+      ) {
+        return this.jsonResponse(400, {
+          error: "invalid_grant",
+          error_description: "Invalid authorization code or client credentials.",
+        });
+      }
+
+      const accessToken = `access-token-${++this.tokenCounter}`;
+      const expiresIn = 3600;
+      this.validAccessTokens.set(accessToken, this.nowFn() + expiresIn * 1000);
+
+      return this.jsonResponse(200, {
+        access_token: accessToken,
+        expires_in: expiresIn,
+        token_type: "Bearer",
+        ...(this.omitRefreshTokenOnCodeExchange ? {} : { refresh_token: this.validRefreshToken }),
+      });
+    }
+
     if (
       this.revokedRefreshToken ||
       grantType !== "refresh_token" ||
@@ -221,10 +250,16 @@ export class FakeGoogleDriveHttp implements HttpTransport {
     const q = url.searchParams.get("q") ?? "";
     const parentMatch = q.match(/'([^']+)' in parents/);
     const parentId = parentMatch ? parentMatch[1] : null;
+    const nameMatch = q.match(/name\s*=\s*'((?:\\'|[^'])*)'/);
+    const expectedName = nameMatch ? nameMatch[1].replace(/\\'/g, "'") : null;
+    const mimeMatch = q.match(/mimeType\s*=\s*'([^']+)'/);
+    const expectedMime = mimeMatch ? mimeMatch[1] : null;
     const requireNotTrashed = q.includes("trashed = false");
 
     const matching = Array.from(this.items.values()).filter((item) => {
       if (parentId && !item.parents.includes(parentId)) return false;
+      if (expectedName !== null && item.name !== expectedName) return false;
+      if (expectedMime !== null && item.mimeType !== expectedMime) return false;
       if (requireNotTrashed && item.trashed) return false;
       return true;
     });
