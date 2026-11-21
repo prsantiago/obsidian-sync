@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { SyncPluginCore } from "../src/sync-plugin-core";
 import { InMemoryVaultPort } from "./fakes/in-memory-vault";
 import { FakeGoogleDriveHttp } from "./fakes/fake-drive-http";
@@ -31,6 +31,10 @@ describe("Google Drive Sync Plugin (Primary Seam)", () => {
     notices = new CapturedNoticeSink();
     plugin = new SyncPluginCore({ vault, http, notice: notices, clock });
     await plugin.load();
+  });
+
+  afterEach(() => {
+    plugin.unload();
   });
 
   describe("Settings configuration bundle import & validation", () => {
@@ -328,6 +332,321 @@ describe("Google Drive Sync Plugin (Primary Seam)", () => {
         "Note-4.md",
         "Note-5.md",
       ]);
+    });
+  });
+
+  describe("Delta pull on cold start, foreground resume & 30-second polling", () => {
+    it("pulls remote creates, new folders, and edits via changes.list on cold start (load) and updates startPageToken + Sync Index", async () => {
+      http.seedFile({
+        id: "f-1",
+        name: "Existing.md",
+        parentId: "root-folder-1",
+        content: "v1",
+        md5Checksum: "md5-v1",
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      const initialData = (await vault.loadPluginData()) as PluginData;
+      const initialToken = initialData.startPageToken!;
+      expect(vault.readTextSync("Existing.md")).toBe("v1");
+
+      // Simulate app restart (cold start): create a fresh plugin instance against same vault & http
+      http.seedFolder("dir-new", "02 - Áreas", "root-folder-1");
+      http.seedFile({
+        id: "f-2",
+        name: "NewNote.md",
+        parentId: "dir-new",
+        content: "created while closed",
+        md5Checksum: "md5-new-1",
+      });
+      http.seedFile({
+        id: "f-1",
+        name: "Existing.md",
+        parentId: "root-folder-1",
+        content: "v2 from macOS",
+        md5Checksum: "md5-v2",
+        modifiedTime: "2026-01-02T00:00:00.000Z",
+      });
+
+      const restartedPlugin = new SyncPluginCore({
+        vault,
+        http,
+        notice: notices,
+        clock: { now: () => now },
+      });
+      await restartedPlugin.load();
+
+      expect(vault.readTextSync("Existing.md")).toBe("v2 from macOS");
+      expect(vault.readTextSync("02 - Áreas/NewNote.md")).toBe("created while closed");
+
+      const updatedData = (await vault.loadPluginData()) as PluginData;
+      expect(updatedData.startPageToken).not.toBe(initialToken);
+      expect(updatedData.syncIndex["Existing.md"]?.md5Checksum).toBe("md5-v2");
+      expect(updatedData.syncIndex["02 - Áreas"]?.type).toBe("folder");
+      expect(updatedData.syncIndex["02 - Áreas/NewNote.md"]?.driveId).toBe("f-2");
+      restartedPlugin.unload();
+    });
+
+    it("polls every 30s while visible, pauses when hidden, and pulls immediately on visibilitychange: visible", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(now);
+        await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+
+        // 1. Remote edit arrives; advance 30s -> pulled automatically
+        http.seedFile({
+          id: "f-poll-1",
+          name: "Polled.md",
+          parentId: "root-folder-1",
+          content: "polled at 30s",
+          md5Checksum: "md5-poll-1",
+        });
+
+        await vi.advanceTimersByTimeAsync(29_999);
+        expect(await vault.exists("Polled.md")).toBe(false);
+
+        await vi.advanceTimersByTimeAsync(1);
+        expect(vault.readTextSync("Polled.md")).toBe("polled at 30s");
+
+        // 2. App becomes hidden -> polling pauses
+        await plugin.handleVisibilityChange(false);
+        http.seedFile({
+          id: "f-poll-2",
+          name: "WhileHidden.md",
+          parentId: "root-folder-1",
+          content: "should wait until visible",
+          md5Checksum: "md5-poll-2",
+        });
+
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(await vault.exists("WhileHidden.md")).toBe(false);
+
+        // 3. App returns to foreground (visible) -> immediate pull + resumes 30s polling
+        await plugin.handleVisibilityChange(true);
+        expect(vault.readTextSync("WhileHidden.md")).toBe("should wait until visible");
+
+        http.seedFile({
+          id: "f-poll-3",
+          name: "ResumedPoll.md",
+          parentId: "root-folder-1",
+          content: "polled after resume",
+          md5Checksum: "md5-poll-3",
+        });
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(vault.readTextSync("ResumedPoll.md")).toBe("polled after resume");
+      } finally {
+        plugin.unload();
+        vi.useRealTimers();
+      }
+    });
+
+    it("skips changes outside root subtree, ignored paths, Google Workspace native files, and unchanged MD5 files", async () => {
+      http.seedFile({
+        id: "f-keep",
+        name: "Keep.md",
+        parentId: "root-folder-1",
+        content: "unchanged body",
+        md5Checksum: "md5-same",
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      http.downloadedFileIds = [];
+
+      // Seed changes outside root subtree, ignored paths, native Docs, and metadata-only touch (same MD5)
+      http.seedFolder("other-root", "OtherFolder", "my-drive-root");
+      http.seedFile({
+        id: "outside-1",
+        name: "Secret.md",
+        parentId: "other-root",
+        content: "outside",
+      });
+      http.seedFolder("obs-dir", ".obsidian", "root-folder-1");
+      http.seedFile({
+        id: "obs-1",
+        name: "app.json",
+        parentId: "obs-dir",
+        content: "{}",
+      });
+      http.seedFile({
+        id: "ds-1",
+        name: ".DS_Store",
+        parentId: "root-folder-1",
+        content: "junk",
+      });
+      http.seedFolder("trash-dir", ".trash", "root-folder-1");
+      http.seedFile({
+        id: "trash-1",
+        name: "Deleted.md",
+        parentId: "trash-dir",
+        content: "trashed",
+      });
+      http.seedFile({
+        id: "gdoc-1",
+        name: "Roadmap",
+        parentId: "root-folder-1",
+        mimeType: "application/vnd.google-apps.document",
+      });
+      // Metadata-only update with identical MD5
+      http.seedFile({
+        id: "f-keep",
+        name: "Keep.md",
+        parentId: "root-folder-1",
+        content: "unchanged body",
+        md5Checksum: "md5-same",
+        modifiedTime: "2026-01-03T00:00:00.000Z",
+      });
+
+      await plugin.pullDelta();
+
+      expect(vault.listAllFilePaths()).toEqual(["Keep.md"]);
+      expect(vault.listAllFolderPaths()).toEqual([]);
+      expect(http.downloadedFileIds).toEqual([]);
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.syncIndex["Keep.md"]?.remoteModifiedTime).toBe("2026-01-03T00:00:00.000Z");
+    });
+
+    it("handles remote file/folder renames and moves within, into, and out of synced root subtree without orphaned duplicates", async () => {
+      http.seedFolder("dir-a", "FolderA", "root-folder-1");
+      http.seedFolder("dir-b", "FolderB", "root-folder-1");
+      http.seedFile({
+        id: "f-a1",
+        name: "Alpha.md",
+        parentId: "dir-a",
+        content: "alpha body",
+        md5Checksum: "md5-alpha",
+      });
+      http.seedFile({
+        id: "f-move-out",
+        name: "LeaveRoot.md",
+        parentId: "root-folder-1",
+        content: "leaving",
+        md5Checksum: "md5-leave",
+      });
+      // External folder outside root-folder-1 with an existing child
+      http.seedFolder("ext-dir", "ImportedProject", "my-drive-root");
+      http.seedFile({
+        id: "ext-file",
+        name: "Spec.md",
+        parentId: "ext-dir",
+        content: "external spec",
+        md5Checksum: "md5-ext",
+      });
+
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      http.downloadedFileIds = [];
+
+      // 1. Rename FolderA -> FolderA-Renamed (moves Alpha.md with it)
+      http.renameOrMoveItem("dir-a", { name: "FolderA-Renamed" });
+      // 2. Move Alpha.md into FolderB and rename to AlphaMoved.md (same content/MD5)
+      http.renameOrMoveItem("f-a1", { name: "AlphaMoved.md", parentId: "dir-b" });
+      // 3. Move external folder ImportedProject INTO root-folder-1
+      http.renameOrMoveItem("ext-dir", { parentId: "root-folder-1" });
+      // 4. Move LeaveRoot.md OUT of root-folder-1 into my-drive-root
+      http.renameOrMoveItem("f-move-out", { parentId: "my-drive-root" });
+
+      await plugin.pullDelta();
+
+      expect(vault.listAllFilePaths()).toEqual([
+        "FolderB/AlphaMoved.md",
+        "ImportedProject/Spec.md",
+      ]);
+      expect(vault.readTextSync("FolderB/AlphaMoved.md")).toBe("alpha body");
+      expect(vault.readTextSync("ImportedProject/Spec.md")).toBe("external spec");
+      // AlphaMoved.md had same MD5, so only ext-file should have been downloaded
+      expect(http.downloadedFileIds).toEqual(["ext-file"]);
+
+      expect(vault.listAllFolderPaths()).toEqual([
+        "FolderA-Renamed",
+        "FolderB",
+        "ImportedProject",
+      ]);
+
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(Object.keys(persisted.syncIndex).sort()).toEqual([
+        "FolderA-Renamed",
+        "FolderB",
+        "FolderB/AlphaMoved.md",
+        "ImportedProject",
+        "ImportedProject/Spec.md",
+      ]);
+      expect(persisted.syncIndex["FolderA"]).toBeUndefined();
+      expect(persisted.syncIndex["FolderA/Alpha.md"]).toBeUndefined();
+      expect(persisted.syncIndex["LeaveRoot.md"]).toBeUndefined();
+    });
+
+    it("falls back to full Drive subtree reconciliation when startPageToken is expired (HTTP 410) and persists a fresh token", async () => {
+      http.seedFile({
+        id: "f-1",
+        name: "Keep.md",
+        parentId: "root-folder-1",
+        content: "v1",
+        md5Checksum: "md5-1",
+      });
+      http.seedFile({
+        id: "f-stale",
+        name: "MovedOutWhileExpired.md",
+        parentId: "root-folder-1",
+        content: "stale",
+        md5Checksum: "md5-stale",
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      const oldData = (await vault.loadPluginData()) as PluginData;
+      const expiredToken = oldData.startPageToken!;
+
+      // Expire the stored token and mutate Drive state
+      http.expirePageToken(expiredToken);
+      http.renameOrMoveItem("f-stale", { parentId: "other-root" });
+      http.seedFile({
+        id: "f-new",
+        name: "Recovered.md",
+        parentId: "root-folder-1",
+        content: "recovered after 410",
+        md5Checksum: "md5-rec",
+      });
+      http.setStartPageToken("9999");
+
+      await plugin.pullDelta();
+
+      expect(vault.listAllFilePaths()).toEqual(["Keep.md", "Recovered.md"]);
+      expect(vault.readTextSync("Recovered.md")).toBe("recovered after 410");
+      const freshData = (await vault.loadPluginData()) as PluginData;
+      expect(freshData.startPageToken).toBe("9999");
+      expect(freshData.syncIndex["MovedOutWhileExpired.md"]).toBeUndefined();
+      expect(freshData.syncIndex["Recovered.md"]?.driveId).toBe("f-new");
+    });
+
+    it("suppresses push echo loops on pulled writes and renames and issues zero Drive write requests", async () => {
+      http.seedFile({
+        id: "f-echo",
+        name: "Original.md",
+        parentId: "root-folder-1",
+        content: "v1",
+        md5Checksum: "md5-1",
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      http.driveRequests = [];
+
+      http.renameOrMoveItem("f-echo", { name: "Renamed.md" });
+      http.seedFile({
+        id: "f-echo-new",
+        name: "PulledWrite.md",
+        parentId: "root-folder-1",
+        content: "from drive",
+        md5Checksum: "md5-2",
+      });
+
+      await plugin.pullDelta();
+
+      // Zero non-GET (upload/mutation) requests to Drive
+      expect(http.driveRequests.filter((r) => r.method !== "GET")).toEqual([]);
+
+      // Pulled/renamed paths are echo-suppressed; unrelated paths are not
+      expect(plugin.isEchoSuppressed("PulledWrite.md")).toBe(true);
+      expect(plugin.isEchoSuppressed("Original.md")).toBe(true);
+      expect(plugin.isEchoSuppressed("Renamed.md")).toBe(true);
+      expect(plugin.isEchoSuppressed("UnrelatedLocalEdit.md")).toBe(false);
+
+      // Suppression expires after the echo window
+      now += 5_000;
+      expect(plugin.isEchoSuppressed("PulledWrite.md")).toBe(false);
     });
   });
 });

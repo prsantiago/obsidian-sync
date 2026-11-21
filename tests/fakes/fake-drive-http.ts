@@ -18,11 +18,21 @@ export interface FakeDriveItem {
   trashed?: boolean;
 }
 
+interface RecordedChange {
+  seq: number;
+  fileId: string;
+  removed?: boolean;
+}
+
 export class FakeGoogleDriveHttp implements HttpTransport {
   private items = new Map<string, FakeDriveItem>();
   private validAccessTokens = new Map<string, number>(); // token -> expiresAt
   private tokenCounter = 0;
   private startPageToken = "100";
+  private changeSeq = 100;
+  private hasIssuedStartPageToken = false;
+  private changesLog: RecordedChange[] = [];
+  private expiredPageTokens = new Set<string>();
   private nowFn: () => number;
 
   public validClientId = "test-client-id";
@@ -34,6 +44,8 @@ export class FakeGoogleDriveHttp implements HttpTransport {
   public forceNextDrive401 = false;
   public defaultPageSize = 1000;
   public tokenRefreshCount = 0;
+  public downloadedFileIds: string[] = [];
+  public driveRequests: Array<{ method: string; url: string }> = [];
 
   constructor(nowFn: () => number = () => Date.now()) {
     this.nowFn = nowFn;
@@ -48,6 +60,9 @@ export class FakeGoogleDriveHttp implements HttpTransport {
       modifiedTime,
       trashed,
     });
+    if (this.hasIssuedStartPageToken) {
+      this.recordChange(id);
+    }
   }
 
   seedFile(opts: {
@@ -72,10 +87,39 @@ export class FakeGoogleDriveHttp implements HttpTransport {
       modifiedTime: opts.modifiedTime ?? "2026-01-01T00:00:00.000Z",
       trashed: opts.trashed ?? false,
     });
+    if (this.hasIssuedStartPageToken) {
+      this.recordChange(opts.id);
+    }
+  }
+
+  renameOrMoveItem(id: string, updates: { name?: string; parentId?: string; modifiedTime?: string }): void {
+    const item = this.items.get(id);
+    if (!item) {
+      throw new Error(`FakeGoogleDriveHttp: item not found: ${id}`);
+    }
+    if (updates.name !== undefined) item.name = updates.name;
+    if (updates.parentId !== undefined) item.parents = [updates.parentId];
+    if (updates.modifiedTime !== undefined) item.modifiedTime = updates.modifiedTime;
+    this.recordChange(id);
+  }
+
+  recordChange(fileId: string, removed = false): string {
+    this.changeSeq += 1;
+    this.startPageToken = String(this.changeSeq);
+    this.changesLog.push({ seq: this.changeSeq, fileId, removed });
+    return this.startPageToken;
+  }
+
+  expirePageToken(token: string): void {
+    this.expiredPageTokens.add(token);
   }
 
   setStartPageToken(token: string): void {
     this.startPageToken = token;
+    const numeric = Number(token);
+    if (!Number.isNaN(numeric) && numeric > this.changeSeq) {
+      this.changeSeq = numeric;
+    }
   }
 
   async request(params: HttpRequest): Promise<HttpResponse> {
@@ -96,23 +140,36 @@ export class FakeGoogleDriveHttp implements HttpTransport {
         });
       }
 
+      this.driveRequests.push({ method: params.method ?? "GET", url: params.url });
       const url = new URL(params.url);
       if (url.pathname === "/drive/v3/files" && (params.method ?? "GET") === "GET") {
         return this.handleFilesList(url);
       }
 
       if (url.pathname === "/drive/v3/changes/startPageToken" && (params.method ?? "GET") === "GET") {
+        this.hasIssuedStartPageToken = true;
         return this.jsonResponse(200, { startPageToken: this.startPageToken });
       }
 
+      if (url.pathname === "/drive/v3/changes" && (params.method ?? "GET") === "GET") {
+        return this.handleChangesList(url);
+      }
+
       const fileGetMatch = url.pathname.match(/^\/drive\/v3\/files\/([^/]+)$/);
-      if (fileGetMatch && (params.method ?? "GET") === "GET" && url.searchParams.get("alt") === "media") {
+      if (fileGetMatch && (params.method ?? "GET") === "GET") {
         const fileId = decodeURIComponent(fileGetMatch[1]);
         const item = this.items.get(fileId);
-        if (!item || !item.content) {
+        if (url.searchParams.get("alt") === "media") {
+          if (!item || !item.content) {
+            return this.jsonResponse(404, { error: { code: 404, message: "File not found" } });
+          }
+          this.downloadedFileIds.push(fileId);
+          return this.binaryResponse(200, item.content);
+        }
+        if (!item) {
           return this.jsonResponse(404, { error: { code: 404, message: "File not found" } });
         }
-        return this.binaryResponse(200, item.content);
+        return this.jsonResponse(200, this.toFileMetadata(item));
       }
     }
 
@@ -218,16 +275,57 @@ export class FakeGoogleDriveHttp implements HttpTransport {
 
     return this.jsonResponse(200, {
       ...(nextPageToken ? { nextPageToken } : {}),
-      files: slice.map((item) => ({
-        id: item.id,
-        name: item.name,
-        mimeType: item.mimeType,
-        parents: item.parents,
-        ...(item.md5Checksum ? { md5Checksum: item.md5Checksum } : {}),
-        modifiedTime: item.modifiedTime,
-        ...(item.content ? { size: String(item.content.byteLength) } : {}),
-      })),
+      files: slice.map((item) => this.toFileMetadata(item)),
     });
+  }
+
+  private handleChangesList(url: URL): HttpResponse {
+    const pageToken = url.searchParams.get("pageToken") ?? "";
+    if (!pageToken || this.expiredPageTokens.has(pageToken)) {
+      return this.jsonResponse(410, {
+        error: { code: 410, message: "Start page token is invalid or expired." },
+      });
+    }
+
+    const sinceSeq = Number(pageToken);
+    const matching = this.changesLog.filter((c) => c.seq > sinceSeq);
+
+    const pageSize = Math.min(
+      Number(url.searchParams.get("pageSize") ?? this.defaultPageSize),
+      this.defaultPageSize,
+    );
+
+    const slice = matching.slice(0, pageSize);
+    const hasMore = matching.length > slice.length;
+    const lastSeqInSlice = slice.length > 0 ? slice[slice.length - 1].seq : sinceSeq;
+    const nextPageToken = hasMore ? String(lastSeqInSlice) : undefined;
+    const newStartPageToken = hasMore ? undefined : String(this.changeSeq);
+
+    return this.jsonResponse(200, {
+      ...(nextPageToken ? { nextPageToken } : {}),
+      ...(newStartPageToken ? { newStartPageToken } : {}),
+      changes: slice.map((c) => {
+        const item = this.items.get(c.fileId);
+        return {
+          fileId: c.fileId,
+          removed: Boolean(c.removed),
+          ...(item && !c.removed ? { file: this.toFileMetadata(item) } : {}),
+        };
+      }),
+    });
+  }
+
+  private toFileMetadata(item: FakeDriveItem) {
+    return {
+      id: item.id,
+      name: item.name,
+      mimeType: item.mimeType,
+      parents: item.parents,
+      ...(item.md5Checksum ? { md5Checksum: item.md5Checksum } : {}),
+      modifiedTime: item.modifiedTime,
+      ...(item.trashed ? { trashed: true } : {}),
+      ...(item.content ? { size: String(item.content.byteLength) } : {}),
+    };
   }
 
   private jsonResponse(status: number, body: unknown): HttpResponse {

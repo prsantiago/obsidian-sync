@@ -19,9 +19,15 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 
     await this.core.load();
     this.addSettingTab(new GoogleDriveSyncSettingTab(this.app, this, this.core));
+
+    if (typeof document !== "undefined") {
+      this.registerDomEvent(document, "visibilitychange", () => {
+        void this.core.handleVisibilityChange(document.visibilityState === "visible");
+      });
+    }
   }
 
   onunload(): void {
-    // Cleanup hooks will be added in subsequent tickets.
+    this.core?.unload();
   }
 }

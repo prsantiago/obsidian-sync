@@ -46,6 +46,9 @@ export interface VaultPort {
   mkdir(path: string): Promise<void>;
   writeBinary(path: string, data: ArrayBuffer): Promise<VaultStat>;
   readBinary(path: string): Promise<ArrayBuffer>;
+  rename(oldPath: string, newPath: string): Promise<void>;
+  remove(path: string): Promise<void>;
+  rmdir(path: string, recursive: boolean): Promise<void>;
   stat(path: string): Promise<VaultStat | null>;
   list(path: string): Promise<{ files: string[]; folders: string[] }>;
   loadPluginData(): Promise<unknown>;
