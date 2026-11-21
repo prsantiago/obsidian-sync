@@ -1,0 +1,14 @@
+node_modules/
+main.js
+*.zip
+.env
+.env.*
+oauth-credentials*.json
+client_secret*.json
+credentials*.json
+token*.json
+config-bundle*.json
+config-bundle*.txt
+.DS_Store
+dist/
+coverage/
