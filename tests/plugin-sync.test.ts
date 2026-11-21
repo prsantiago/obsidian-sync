@@ -937,4 +937,298 @@ describe("Google Drive Sync Plugin (Primary Seam)", () => {
       expect(http.multipartUploadCount).toBe(0);
     });
   });
+
+  describe("Edit-vs-edit conflict resolution", () => {
+    it("keeps local version at original path when local is newer, saves remote as conflict copy, syncs both, and emits Notice", async () => {
+      http.seedFile({
+        id: "file-1",
+        name: "Note.md",
+        parentId: "root-folder-1",
+        content: "baseline",
+        modifiedTime: new Date(now).toISOString(),
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+
+      // Remote edits Note.md at now + 10s
+      now += 10_000;
+      http.seedFile({
+        id: "file-1",
+        name: "Note.md",
+        parentId: "root-folder-1",
+        content: "remote edit",
+        md5Checksum: "md5-remote-v2",
+        modifiedTime: new Date(now).toISOString(),
+      });
+
+      // Local edits Note.md later at now + 50s (newer!)
+      now += 50_000;
+      await vault.writeBinary("Note.md", new TextEncoder().encode("local edit newer").buffer);
+      plugin.onVaultModify("Note.md");
+
+      // Pull runs before push
+      await plugin.pullDelta();
+
+      // Local newer version stays at Note.md in both local vault and Drive
+      expect(vault.readTextSync("Note.md")).toBe("local edit newer");
+      const remoteCanonical = http.findItemByName("Note.md", "root-folder-1");
+      expect(new TextDecoder().decode(remoteCanonical?.content)).toBe("local edit newer");
+
+      // Older remote version saved as conflict copy in both local vault and Drive
+      const expectedConflictName = "Note (conflict 2023-11-14 22-14).md";
+      expect(vault.readTextSync(expectedConflictName)).toBe("remote edit");
+      const remoteConflict = http.findItemByName(expectedConflictName, "root-folder-1");
+      expect(remoteConflict).toBeDefined();
+      expect(new TextDecoder().decode(remoteConflict?.content)).toBe("remote edit");
+
+      // Both tracked in Sync Index
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.syncIndex["Note.md"]).toBeDefined();
+      expect(persisted.syncIndex[expectedConflictName]).toBeDefined();
+      expect(persisted.syncIndex[expectedConflictName].driveId).toBe(remoteConflict?.id);
+
+      // Notice emitted naming the conflicted file
+      expect(notices.notices.some((m) => m.message.includes("Note.md"))).toBe(true);
+    });
+
+    it("keeps remote version at original path when remote is newer, saves local as conflict copy, syncs both, and emits Notice", async () => {
+      http.seedFile({
+        id: "file-1",
+        name: "Note.md",
+        parentId: "root-folder-1",
+        content: "baseline",
+        modifiedTime: new Date(now).toISOString(),
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+
+      // Local edits Note.md at now + 10s
+      now += 10_000;
+      await vault.writeBinary("Note.md", new TextEncoder().encode("local edit older").buffer);
+      plugin.onVaultModify("Note.md");
+
+      // Remote edits Note.md later at now + 50s (newer!)
+      now += 50_000;
+      http.seedFile({
+        id: "file-1",
+        name: "Note.md",
+        parentId: "root-folder-1",
+        content: "remote edit newer",
+        md5Checksum: "md5-remote-v2",
+        modifiedTime: new Date(now).toISOString(),
+      });
+
+      await plugin.pullDelta();
+
+      // Remote newer version stays at Note.md in both local vault and Drive
+      expect(vault.readTextSync("Note.md")).toBe("remote edit newer");
+      const remoteCanonical = http.findItemByName("Note.md", "root-folder-1");
+      expect(new TextDecoder().decode(remoteCanonical?.content)).toBe("remote edit newer");
+
+      // Older local version saved as conflict copy in both local vault and Drive
+      const expectedConflictName = "Note (conflict 2023-11-14 22-14).md";
+      expect(vault.readTextSync(expectedConflictName)).toBe("local edit older");
+      const remoteConflict = http.findItemByName(expectedConflictName, "root-folder-1");
+      expect(remoteConflict).toBeDefined();
+      expect(new TextDecoder().decode(remoteConflict?.content)).toBe("local edit older");
+
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.syncIndex["Note.md"]).toBeDefined();
+      expect(persisted.syncIndex[expectedConflictName]).toBeDefined();
+      expect(notices.notices.some((m) => m.message.includes("Note.md"))).toBe(true);
+    });
+
+    it("detects and resolves edit-vs-edit conflict during local push before pullDelta runs", async () => {
+      http.seedFile({
+        id: "file-1",
+        name: "PushFirst.md",
+        parentId: "root-folder-1",
+        content: "baseline",
+        modifiedTime: new Date(now).toISOString(),
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+
+      // Remote edits PushFirst.md at now + 10s
+      now += 10_000;
+      http.seedFile({
+        id: "file-1",
+        name: "PushFirst.md",
+        parentId: "root-folder-1",
+        content: "remote edit",
+        md5Checksum: "md5-remote-v2",
+        modifiedTime: new Date(now).toISOString(),
+      });
+
+      // Local edits PushFirst.md later at now + 50s and triggers syncNow() before pullDelta()
+      now += 50_000;
+      await vault.writeBinary("PushFirst.md", new TextEncoder().encode("local edit newer").buffer);
+      plugin.onVaultModify("PushFirst.md");
+      await plugin.syncNow();
+
+      expect(vault.readTextSync("PushFirst.md")).toBe("local edit newer");
+      const remoteCanonical = http.findItemByName("PushFirst.md", "root-folder-1");
+      expect(new TextDecoder().decode(remoteCanonical?.content)).toBe("local edit newer");
+
+      const expectedConflictName = "PushFirst (conflict 2023-11-14 22-14).md";
+      expect(vault.readTextSync(expectedConflictName)).toBe("remote edit");
+      const remoteConflict = http.findItemByName(expectedConflictName, "root-folder-1");
+      expect(remoteConflict).toBeDefined();
+      expect(new TextDecoder().decode(remoteConflict?.content)).toBe("remote edit");
+      expect(notices.notices.some((m) => m.message.includes("PushFirst.md"))).toBe(true);
+    });
+
+    it("converges without creating a conflict copy when local and remote make identical concurrent edits", async () => {
+      http.seedFile({
+        id: "file-1",
+        name: "Same.md",
+        parentId: "root-folder-1",
+        content: "baseline",
+        modifiedTime: new Date(now).toISOString(),
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+
+      now += 10_000;
+      http.seedFile({
+        id: "file-1",
+        name: "Same.md",
+        parentId: "root-folder-1",
+        content: "identical new text",
+        md5Checksum: "md5-same-v2",
+        modifiedTime: new Date(now).toISOString(),
+      });
+
+      now += 20_000;
+      await vault.writeBinary("Same.md", new TextEncoder().encode("identical new text").buffer);
+      plugin.onVaultModify("Same.md");
+
+      await plugin.pullDelta();
+
+      expect(vault.readTextSync("Same.md")).toBe("identical new text");
+      const rootFiles = (await vault.list("")).files;
+      expect(rootFiles).toEqual(["Same.md"]);
+      expect(notices.notices.some((m) => /conflict/i.test(m.message))).toBe(false);
+    });
+
+    it("handles extensionless filenames cleanly when creating conflict copies", async () => {
+      http.seedFile({
+        id: "file-extless",
+        name: "README",
+        parentId: "root-folder-1",
+        content: "baseline",
+        modifiedTime: new Date(now).toISOString(),
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+
+      now += 10_000;
+      http.seedFile({
+        id: "file-extless",
+        name: "README",
+        parentId: "root-folder-1",
+        content: "remote readme",
+        md5Checksum: "md5-readme-v2",
+        modifiedTime: new Date(now).toISOString(),
+      });
+
+      now += 50_000;
+      await vault.writeBinary("README", new TextEncoder().encode("local readme").buffer);
+      plugin.onVaultModify("README");
+
+      await plugin.pullDelta();
+
+      expect(vault.readTextSync("README")).toBe("local readme");
+      const expectedConflictName = "README (conflict 2023-11-14 22-14)";
+      expect(vault.readTextSync(expectedConflictName)).toBe("remote readme");
+      expect(http.findItemByName(expectedConflictName, "root-folder-1")).toBeDefined();
+    });
+
+    it("appends a disambiguating suffix if the conflict filename already exists", async () => {
+      http.seedFile({
+        id: "file-1",
+        name: "Note.md",
+        parentId: "root-folder-1",
+        content: "baseline",
+        modifiedTime: new Date(now).toISOString(),
+      });
+      // Pre-existing conflict file at the exact same timestamp
+      const firstConflictName = "Note (conflict 2023-11-14 22-14).md";
+      http.seedFile({
+        id: "file-existing-conflict",
+        name: firstConflictName,
+        parentId: "root-folder-1",
+        content: "earlier conflict",
+        modifiedTime: new Date(now).toISOString(),
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+
+      now += 10_000;
+      http.seedFile({
+        id: "file-1",
+        name: "Note.md",
+        parentId: "root-folder-1",
+        content: "remote v2",
+        md5Checksum: "md5-remote-v2",
+        modifiedTime: new Date(now).toISOString(),
+      });
+
+      now += 50_000;
+      await vault.writeBinary("Note.md", new TextEncoder().encode("local v2").buffer);
+      plugin.onVaultModify("Note.md");
+
+      await plugin.pullDelta();
+
+      const disambiguatedConflictName = "Note (conflict 2023-11-14 22-14) (2).md";
+      expect(vault.readTextSync(firstConflictName)).toBe("earlier conflict");
+      expect(vault.readTextSync(disambiguatedConflictName)).toBe("remote v2");
+      expect(http.findItemByName(disambiguatedConflictName, "root-folder-1")).toBeDefined();
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.syncIndex[disambiguatedConflictName]).toBeDefined();
+    });
+
+    it("resolves conflicts on binary attachments byte-for-byte", async () => {
+      const baselineBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x00]);
+      const remoteBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x01, 0x02]);
+      const localBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x03, 0x04, 0x05]);
+
+      http.seedFolder("folder-assets", "assets", "root-folder-1");
+      http.seedFile({
+        id: "img-1",
+        name: "diagram.png",
+        parentId: "folder-assets",
+        mimeType: "image/png",
+        content: baselineBytes,
+        modifiedTime: new Date(now).toISOString(),
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+
+      // Remote edits diagram.png later (newer!)
+      now += 60_000;
+      http.seedFile({
+        id: "img-1",
+        name: "diagram.png",
+        parentId: "folder-assets",
+        mimeType: "image/png",
+        content: remoteBytes,
+        md5Checksum: "md5-img-remote",
+        modifiedTime: new Date(now).toISOString(),
+      });
+
+      // Local edited diagram.png earlier (older)
+      now -= 30_000;
+      await vault.writeBinary("assets/diagram.png", localBytes.slice().buffer);
+      plugin.onVaultModify("assets/diagram.png");
+
+      // Advance clock for conflict timestamp
+      now += 30_000;
+      await plugin.pullDelta();
+
+      const localCanonical = new Uint8Array(await vault.readBinary("assets/diagram.png"));
+      expect(localCanonical).toEqual(remoteBytes);
+
+      const conflictPath = "assets/diagram (conflict 2023-11-14 22-14).png";
+      const localConflict = new Uint8Array(await vault.readBinary(conflictPath));
+      expect(localConflict).toEqual(localBytes);
+
+      const remoteConflict = http.findItemByName("diagram (conflict 2023-11-14 22-14).png", "folder-assets");
+      expect(remoteConflict?.content).toEqual(localBytes);
+      expect(notices.notices.some((m) => m.message.includes("assets/diagram.png"))).toBe(true);
+    });
+  });
 });
