@@ -196,4 +196,35 @@ export class InMemoryVaultPort implements VaultPort {
   listAllFolderPaths(): string[] {
     return Array.from(this.folders).sort();
   }
+
+  simulateRename(oldPath: string, newPath: string): void {
+    const oldNorm = this.normalizePath(oldPath);
+    const newNorm = this.normalizePath(newPath);
+
+    const file = this.files.get(oldNorm);
+    if (file) {
+      this.files.delete(oldNorm);
+      this.files.set(newNorm, file);
+      return;
+    }
+
+    if (this.folders.has(oldNorm)) {
+      this.folders.delete(oldNorm);
+      this.folders.add(newNorm);
+      const oldPrefix = `${oldNorm}/`;
+      const newPrefix = `${newNorm}/`;
+      for (const [k, v] of Array.from(this.files.entries())) {
+        if (k.startsWith(oldPrefix)) {
+          this.files.delete(k);
+          this.files.set(newPrefix + k.slice(oldPrefix.length), v);
+        }
+      }
+      for (const f of Array.from(this.folders)) {
+        if (f.startsWith(oldPrefix)) {
+          this.folders.delete(f);
+          this.folders.add(newPrefix + f.slice(oldPrefix.length));
+        }
+      }
+    }
+  }
 }

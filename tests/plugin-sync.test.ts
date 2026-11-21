@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SyncPluginCore } from "../src/sync-plugin-core";
 import { InMemoryVaultPort } from "./fakes/in-memory-vault";
 import { FakeGoogleDriveHttp } from "./fakes/fake-drive-http";
@@ -647,6 +647,294 @@ describe("Google Drive Sync Plugin (Primary Seam)", () => {
       // Suppression expires after the echo window
       now += 5_000;
       expect(plugin.isEchoSuppressed("PulledWrite.md")).toBe(false);
+    });
+  });
+
+  describe("Automatic near-instant push & app-switch flush", () => {
+    beforeEach(async () => {
+      vi.useFakeTimers();
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+    });
+
+    afterEach(() => {
+      plugin.dispose();
+      vi.useRealTimers();
+    });
+
+    it("pushes a newly created markdown note to Google Drive ~500ms after the vault create event and updates Sync Index", async () => {
+      await vault.writeBinary("Daily.md", new TextEncoder().encode("# Hello Drive").buffer);
+      plugin.onVaultCreate("Daily.md", "file");
+
+      // Before 500ms, it has not been uploaded yet
+      await vi.advanceTimersByTimeAsync(400);
+      expect(http.findItemByName("Daily.md", "root-folder-1")).toBeUndefined();
+
+      // At 500ms, debounce fires and uploads via multipart
+      await vi.advanceTimersByTimeAsync(100);
+      const remote = http.findItemByName("Daily.md", "root-folder-1");
+      expect(remote).toBeDefined();
+      expect(new TextDecoder().decode(remote!.content)).toBe("# Hello Drive");
+      expect(http.multipartUploadCount).toBe(1);
+
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.syncIndex["Daily.md"]).toMatchObject({
+        path: "Daily.md",
+        driveId: remote!.id,
+        parentId: "root-folder-1",
+        md5Checksum: remote!.md5Checksum,
+        remoteModifiedTime: remote!.modifiedTime,
+        type: "file",
+      });
+    });
+
+    it("coalesces rapid consecutive edits within the 500ms debounce window into a single upload", async () => {
+      http.seedFile({
+        id: "existing-note",
+        name: "Journal.md",
+        parentId: "root-folder-1",
+        content: "v0",
+      });
+      // Re-run initial pull to track Journal.md
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+
+      await vault.writeBinary("Journal.md", new TextEncoder().encode("v1").buffer);
+      plugin.onVaultModify("Journal.md");
+      await vi.advanceTimersByTimeAsync(250);
+
+      await vault.writeBinary("Journal.md", new TextEncoder().encode("v2").buffer);
+      plugin.onVaultModify("Journal.md");
+      await vi.advanceTimersByTimeAsync(250);
+
+      // Still hasn't fired because second edit reset the 500ms timer
+      expect(http.multipartUploadCount).toBe(0);
+
+      await vault.writeBinary("Journal.md", new TextEncoder().encode("v3-final").buffer);
+      plugin.onVaultModify("Journal.md");
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(http.multipartUploadCount).toBe(1);
+      const remote = http.getItem("existing-note");
+      expect(new TextDecoder().decode(remote!.content)).toBe("v3-final");
+    });
+
+    it("creates nested Drive folders on demand and uploads binary attachments byte-for-byte", async () => {
+      const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff]);
+      await vault.mkdir("Projects/2026/Assets");
+      plugin.onVaultCreate("Projects", "folder");
+      plugin.onVaultCreate("Projects/2026", "folder");
+      plugin.onVaultCreate("Projects/2026/Assets", "folder");
+      await vault.writeBinary("Projects/2026/Assets/diagram.png", pngBytes.buffer);
+      plugin.onVaultCreate("Projects/2026/Assets/diagram.png", "file");
+
+      await vi.advanceTimersByTimeAsync(500);
+
+      const projectsFolder = http.findItemByName("Projects", "root-folder-1");
+      expect(projectsFolder).toBeDefined();
+      const yearFolder = http.findItemByName("2026", projectsFolder!.id);
+      expect(yearFolder).toBeDefined();
+      const assetsFolder = http.findItemByName("Assets", yearFolder!.id);
+      expect(assetsFolder).toBeDefined();
+      const remotePng = http.findItemByName("diagram.png", assetsFolder!.id);
+      expect(remotePng).toBeDefined();
+      expect(remotePng!.content).toEqual(pngBytes);
+
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.syncIndex["Projects/2026/Assets"]?.driveId).toBe(assetsFolder!.id);
+      expect(persisted.syncIndex["Projects/2026/Assets/diagram.png"]?.parentId).toBe(
+        assetsFolder!.id,
+      );
+    });
+
+    it("uses multipart upload for files <= 5 MB and resumable upload for files > 5 MB with byte-for-byte fidelity", async () => {
+      const fiveMb = 5 * 1024 * 1024;
+      const exact5Mb = new Uint8Array(fiveMb);
+      exact5Mb[0] = 0x11;
+      exact5Mb[fiveMb - 1] = 0x22;
+
+      const over5Mb = new Uint8Array(fiveMb + 1);
+      over5Mb[0] = 0xaa;
+      over5Mb[fiveMb] = 0xbb;
+
+      await vault.writeBinary("exact-5mb.bin", exact5Mb.buffer);
+      plugin.onVaultCreate("exact-5mb.bin", "file");
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(http.multipartUploadCount).toBe(1);
+      expect(http.resumableUploadCount).toBe(0);
+      const remoteExact = http.findItemByName("exact-5mb.bin", "root-folder-1");
+      expect(remoteExact!.content!.byteLength).toBe(fiveMb);
+      expect(remoteExact!.content![0]).toBe(0x11);
+      expect(remoteExact!.content![fiveMb - 1]).toBe(0x22);
+
+      await vault.writeBinary("large-video.bin", over5Mb.buffer);
+      plugin.onVaultCreate("large-video.bin", "file");
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(http.multipartUploadCount).toBe(1);
+      expect(http.resumableUploadCount).toBe(1);
+      const remoteLarge = http.findItemByName("large-video.bin", "root-folder-1");
+      expect(remoteLarge!.content!.byteLength).toBe(fiveMb + 1);
+      expect(remoteLarge!.content![0]).toBe(0xaa);
+      expect(remoteLarge!.content![fiveMb]).toBe(0xbb);
+    });
+
+    it("renames and moves files and folders on Drive without leaving duplicate ghost files", async () => {
+      http.seedFolder("dir-a", "Inbox", "root-folder-1");
+      http.seedFolder("dir-b", "Archive", "root-folder-1");
+      http.seedFile({
+        id: "note-1",
+        name: "Draft.md",
+        parentId: "dir-a",
+        content: "hello",
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+
+      // Move and rename Draft.md -> Archive/Published.md
+      vault.simulateRename("Inbox/Draft.md", "Archive/Published.md");
+      plugin.onVaultRename("Inbox/Draft.md", "Archive/Published.md", "file");
+      await vi.advanceTimersByTimeAsync(500);
+
+      const movedNote = http.getItem("note-1");
+      expect(movedNote?.name).toBe("Published.md");
+      expect(movedNote?.parents).toEqual(["dir-b"]);
+      expect(http.findItemByName("Draft.md", "dir-a")).toBeUndefined();
+
+      // Rename folder Archive -> Done (updating descendant Sync Index paths too)
+      vault.simulateRename("Archive", "Done");
+      plugin.onVaultRename("Archive", "Done", "folder");
+      await vi.advanceTimersByTimeAsync(500);
+
+      const renamedFolder = http.getItem("dir-b");
+      expect(renamedFolder?.name).toBe("Done");
+      expect(renamedFolder?.parents).toEqual(["root-folder-1"]);
+      expect(http.listAllItems().filter((i) => i.name === "Published.md")).toHaveLength(1);
+
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.syncIndex["Inbox/Draft.md"]).toBeUndefined();
+      expect(persisted.syncIndex["Archive"]).toBeUndefined();
+      expect(persisted.syncIndex["Archive/Published.md"]).toBeUndefined();
+      expect(persisted.syncIndex["Done"]?.driveId).toBe("dir-b");
+      expect(persisted.syncIndex["Done/Published.md"]?.driveId).toBe("note-1");
+    });
+
+    it("cancels the debounce timer and immediately flushes pending changes on visibilitychange: hidden", async () => {
+      await vault.writeBinary("QuickNote.md", new TextEncoder().encode("before lock").buffer);
+      plugin.onVaultCreate("QuickNote.md", "file");
+
+      // Only 50ms elapsed, timer hasn't fired
+      await vi.advanceTimersByTimeAsync(50);
+      expect(http.findItemByName("QuickNote.md", "root-folder-1")).toBeUndefined();
+
+      // App switches away / screen locks -> immediate flush
+      await plugin.onVisibilityHidden();
+      expect(http.findItemByName("QuickNote.md", "root-folder-1")).toBeDefined();
+      expect(http.multipartUploadCount).toBe(1);
+
+      // Advancing past the original 500ms window does NOT trigger a duplicate upload
+      await vi.advanceTimersByTimeAsync(500);
+      expect(http.multipartUploadCount).toBe(1);
+    });
+
+    it("flushes pending changes immediately when syncNow() command is triggered", async () => {
+      await vault.writeBinary("ManualSync.md", new TextEncoder().encode("sync me").buffer);
+      plugin.onVaultCreate("ManualSync.md", "file");
+
+      await plugin.syncNow();
+      expect(http.findItemByName("ManualSync.md", "root-folder-1")).toBeDefined();
+      expect(http.multipartUploadCount).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(500);
+      expect(http.multipartUploadCount).toBe(1);
+    });
+
+    it("ignores local changes under .obsidian/, .trash/, and any .DS_Store", async () => {
+      await vault.writeBinary(".obsidian/workspace.json", new TextEncoder().encode("{}").buffer);
+      await vault.writeBinary(".trash/deleted.md", new TextEncoder().encode("trash").buffer);
+      await vault.writeBinary(".DS_Store", new Uint8Array([1, 2, 3]).buffer);
+      await vault.writeBinary("Notes/.DS_Store", new Uint8Array([4, 5, 6]).buffer);
+
+      plugin.onVaultCreate(".obsidian/workspace.json", "file");
+      plugin.onVaultModify(".obsidian/workspace.json");
+      plugin.onVaultCreate(".trash/deleted.md", "file");
+      plugin.onVaultCreate(".DS_Store", "file");
+      plugin.onVaultCreate("Notes/.DS_Store", "file");
+
+      await vi.advanceTimersByTimeAsync(500);
+      expect(http.multipartUploadCount).toBe(0);
+      expect(http.listAllItems()).toHaveLength(0);
+    });
+
+    it("serializes concurrent sync triggers via a single-flight lock with a follow-up pass", async () => {
+      await vault.writeBinary("A.md", new TextEncoder().encode("first").buffer);
+      plugin.onVaultCreate("A.md", "file");
+
+      // Gate the first HTTP upload so we can trigger a concurrent sync while it is in flight
+      let releaseFirstUpload!: () => void;
+      const firstUploadGate = new Promise<void>((resolve) => {
+        releaseFirstUpload = resolve;
+      });
+      let inFlightUploads = 0;
+      let maxConcurrentUploads = 0;
+      const origRequest = http.request.bind(http);
+      const requestSpy = vi.spyOn(http, "request").mockImplementation(async (params) => {
+        if (params.url.includes("/upload/drive/v3/files")) {
+          inFlightUploads += 1;
+          maxConcurrentUploads = Math.max(maxConcurrentUploads, inFlightUploads);
+          if (http.multipartUploadCount === 0) {
+            await firstUploadGate;
+          }
+          try {
+            return await origRequest(params);
+          } finally {
+            inFlightUploads -= 1;
+          }
+        }
+        return origRequest(params);
+      });
+
+      const firstSync = plugin.syncNow();
+      // Yield microtasks so firstSync reaches the upload gate
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // Queue another local change and trigger a concurrent syncNow while firstSync is in flight
+      await vault.writeBinary("B.md", new TextEncoder().encode("second").buffer);
+      plugin.onVaultCreate("B.md", "file");
+      const secondSync = plugin.syncNow();
+
+      // Release the first upload and await both sync calls
+      releaseFirstUpload();
+      await Promise.all([firstSync, secondSync]);
+      requestSpy.mockRestore();
+
+      expect(maxConcurrentUploads).toBe(1);
+      expect(http.findItemByName("A.md", "root-folder-1")).toBeDefined();
+      expect(http.findItemByName("B.md", "root-folder-1")).toBeDefined();
+    });
+
+    it("suppresses echo pushes for plugin-initiated local writes during pull", async () => {
+      http.seedFile({
+        id: "remote-1",
+        name: "FromMac.md",
+        parentId: "root-folder-1",
+        content: "mac content",
+      });
+
+      // Simulate Obsidian emitting vault create/modify events whenever writeBinary/mkdir runs
+      const origWrite = vault.writeBinary.bind(vault);
+      const writeSpy = vi.spyOn(vault, "writeBinary").mockImplementation(async (path, data) => {
+        const st = await origWrite(path, data);
+        plugin.onVaultCreate(path, "file");
+        plugin.onVaultModify(path);
+        return st;
+      });
+
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      writeSpy.mockRestore();
+
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(http.multipartUploadCount).toBe(0);
     });
   });
 });
