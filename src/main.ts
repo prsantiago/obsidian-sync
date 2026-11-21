@@ -1,4 +1,4 @@
-import { Plugin } from "obsidian";
+import { Plugin, TFolder } from "obsidian";
 import {
   ObsidianHttpTransport,
   ObsidianNoticeSink,
@@ -19,9 +19,46 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 
     await this.core.load();
     this.addSettingTab(new GoogleDriveSyncSettingTab(this.app, this, this.core));
+
+    this.addCommand({
+      id: "sync-now",
+      name: "Sync now",
+      callback: () => {
+        void this.core.syncNow();
+      },
+    });
+
+    this.registerDomEvent(document, "visibilitychange", () => {
+      if (document.visibilityState === "hidden") {
+        void this.core.onVisibilityHidden();
+      }
+    });
+
+    this.app.workspace.onLayoutReady(() => {
+      this.registerEvent(
+        this.app.vault.on("create", (file) => {
+          this.core.onVaultCreate(file.path, file instanceof TFolder ? "folder" : "file");
+        }),
+      );
+      this.registerEvent(
+        this.app.vault.on("modify", (file) => {
+          this.core.onVaultModify(file.path);
+        }),
+      );
+      this.registerEvent(
+        this.app.vault.on("rename", (file, oldPath) => {
+          this.core.onVaultRename(oldPath, file.path, file instanceof TFolder ? "folder" : "file");
+        }),
+      );
+      this.registerEvent(
+        this.app.vault.on("delete", (file) => {
+          this.core.onVaultDelete(file.path);
+        }),
+      );
+    });
   }
 
   onunload(): void {
-    // Cleanup hooks will be added in subsequent tickets.
+    this.core?.dispose();
   }
 }

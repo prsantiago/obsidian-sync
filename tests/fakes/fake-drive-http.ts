@@ -18,10 +18,20 @@ export interface FakeDriveItem {
   trashed?: boolean;
 }
 
+interface ResumableSession {
+  fileId?: string;
+  name?: string;
+  mimeType?: string;
+  parents?: string[];
+}
+
 export class FakeGoogleDriveHttp implements HttpTransport {
   private items = new Map<string, FakeDriveItem>();
   private validAccessTokens = new Map<string, number>(); // token -> expiresAt
+  private resumableSessions = new Map<string, ResumableSession>();
   private tokenCounter = 0;
+  private itemCounter = 0;
+  private sessionCounter = 0;
   private startPageToken = "100";
   private nowFn: () => number;
 
@@ -32,6 +42,8 @@ export class FakeGoogleDriveHttp implements HttpTransport {
   public forceNextDrive401 = false;
   public defaultPageSize = 1000;
   public tokenRefreshCount = 0;
+  public multipartUploadCount = 0;
+  public resumableUploadCount = 0;
 
   constructor(nowFn: () => number = () => Date.now()) {
     this.nowFn = nowFn;
@@ -76,12 +88,41 @@ export class FakeGoogleDriveHttp implements HttpTransport {
     this.startPageToken = token;
   }
 
+  getItem(id: string): FakeDriveItem | undefined {
+    return this.items.get(id);
+  }
+
+  findItemByName(name: string, parentId?: string): FakeDriveItem | undefined {
+    for (const item of this.items.values()) {
+      if (item.trashed) continue;
+      if (item.name === name && (!parentId || item.parents.includes(parentId))) {
+        return item;
+      }
+    }
+    return undefined;
+  }
+
+  listAllItems(): FakeDriveItem[] {
+    return Array.from(this.items.values()).filter((i) => !i.trashed);
+  }
+
   async request(params: HttpRequest): Promise<HttpResponse> {
     if (params.url === GOOGLE_OAUTH_TOKEN_URL && params.method === "POST") {
       return this.handleTokenRefresh(params);
     }
 
-    if (params.url.startsWith(GOOGLE_DRIVE_API_BASE)) {
+    const url = new URL(params.url);
+
+    // Resumable upload PUT to session URI does not require Bearer header (session URI is pre-authenticated)
+    const sessionMatch = url.pathname.match(/^\/upload\/drive\/v3\/sessions\/([^/]+)$/);
+    if (sessionMatch && params.method === "PUT") {
+      return this.handleResumablePut(decodeURIComponent(sessionMatch[1]), params);
+    }
+
+    if (
+      params.url.startsWith(GOOGLE_DRIVE_API_BASE) ||
+      params.url.startsWith("https://www.googleapis.com/upload/drive/v3")
+    ) {
       if (!this.isAuthorized(params.headers)) {
         return this.jsonResponse(401, {
           error: { code: 401, message: "Invalid Credentials" },
@@ -94,23 +135,54 @@ export class FakeGoogleDriveHttp implements HttpTransport {
         });
       }
 
-      const url = new URL(params.url);
-      if (url.pathname === "/drive/v3/files" && (params.method ?? "GET") === "GET") {
+      const method = params.method ?? "GET";
+
+      if (url.pathname === "/drive/v3/files" && method === "GET") {
         return this.handleFilesList(url);
       }
 
-      if (url.pathname === "/drive/v3/changes/startPageToken" && (params.method ?? "GET") === "GET") {
+      if (url.pathname === "/drive/v3/files" && method === "POST") {
+        return this.handleCreateMetadata(params);
+      }
+
+      if (url.pathname === "/drive/v3/changes/startPageToken" && method === "GET") {
         return this.jsonResponse(200, { startPageToken: this.startPageToken });
       }
 
-      const fileGetMatch = url.pathname.match(/^\/drive\/v3\/files\/([^/]+)$/);
-      if (fileGetMatch && (params.method ?? "GET") === "GET" && url.searchParams.get("alt") === "media") {
-        const fileId = decodeURIComponent(fileGetMatch[1]);
+      const fileMatch = url.pathname.match(/^\/drive\/v3\/files\/([^/]+)$/);
+      if (fileMatch && method === "GET" && url.searchParams.get("alt") === "media") {
+        const fileId = decodeURIComponent(fileMatch[1]);
         const item = this.items.get(fileId);
         if (!item || !item.content) {
           return this.jsonResponse(404, { error: { code: 404, message: "File not found" } });
         }
         return this.binaryResponse(200, item.content);
+      }
+
+      if (fileMatch && method === "PATCH") {
+        return this.handlePatchMetadata(decodeURIComponent(fileMatch[1]), url, params);
+      }
+
+      if (url.pathname === "/upload/drive/v3/files" && method === "POST") {
+        const uploadType = url.searchParams.get("uploadType");
+        if (uploadType === "multipart") {
+          return this.handleMultipartUpload(undefined, params);
+        }
+        if (uploadType === "resumable") {
+          return this.handleResumableInit(undefined, params);
+        }
+      }
+
+      const uploadFileMatch = url.pathname.match(/^\/upload\/drive\/v3\/files\/([^/]+)$/);
+      if (uploadFileMatch && method === "PATCH") {
+        const fileId = decodeURIComponent(uploadFileMatch[1]);
+        const uploadType = url.searchParams.get("uploadType");
+        if (uploadType === "multipart") {
+          return this.handleMultipartUpload(fileId, params);
+        }
+        if (uploadType === "resumable") {
+          return this.handleResumableInit(fileId, params);
+        }
       }
     }
 
@@ -183,16 +255,214 @@ export class FakeGoogleDriveHttp implements HttpTransport {
 
     return this.jsonResponse(200, {
       ...(nextPageToken ? { nextPageToken } : {}),
-      files: slice.map((item) => ({
-        id: item.id,
-        name: item.name,
-        mimeType: item.mimeType,
-        parents: item.parents,
-        ...(item.md5Checksum ? { md5Checksum: item.md5Checksum } : {}),
-        modifiedTime: item.modifiedTime,
-        ...(item.content ? { size: String(item.content.byteLength) } : {}),
-      })),
+      files: slice.map((item) => this.toMetadataDto(item)),
     });
+  }
+
+  private toMetadataDto(item: FakeDriveItem) {
+    return {
+      id: item.id,
+      name: item.name,
+      mimeType: item.mimeType,
+      parents: item.parents,
+      ...(item.md5Checksum ? { md5Checksum: item.md5Checksum } : {}),
+      modifiedTime: item.modifiedTime,
+      ...(item.content ? { size: String(item.content.byteLength) } : {}),
+    };
+  }
+
+  private handleCreateMetadata(params: HttpRequest): HttpResponse {
+    const body = JSON.parse(typeof params.body === "string" ? params.body : "{}") as {
+      name?: string;
+      mimeType?: string;
+      parents?: string[];
+    };
+    const id = `drive-item-${++this.itemCounter}`;
+    const item: FakeDriveItem = {
+      id,
+      name: body.name ?? "untitled",
+      mimeType: body.mimeType ?? GOOGLE_FOLDER_MIME,
+      parents: body.parents ?? [],
+      modifiedTime: new Date(this.nowFn()).toISOString(),
+      trashed: false,
+    };
+    this.items.set(id, item);
+    return this.jsonResponse(200, this.toMetadataDto(item));
+  }
+
+  private handlePatchMetadata(fileId: string, url: URL, params: HttpRequest): HttpResponse {
+    const item = this.items.get(fileId);
+    if (!item || item.trashed) {
+      return this.jsonResponse(404, { error: { code: 404, message: "File not found" } });
+    }
+    const body = JSON.parse(typeof params.body === "string" ? params.body : "{}") as {
+      name?: string;
+      trashed?: boolean;
+    };
+    if (body.name !== undefined) {
+      item.name = body.name;
+    }
+    if (body.trashed !== undefined) {
+      item.trashed = body.trashed;
+    }
+    const removeParents = (url.searchParams.get("removeParents") ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const addParents = (url.searchParams.get("addParents") ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (removeParents.length > 0) {
+      item.parents = item.parents.filter((p) => !removeParents.includes(p));
+    }
+    for (const p of addParents) {
+      if (!item.parents.includes(p)) {
+        item.parents.push(p);
+      }
+    }
+    item.modifiedTime = new Date(this.nowFn()).toISOString();
+    return this.jsonResponse(200, this.toMetadataDto(item));
+  }
+
+  private handleMultipartUpload(fileId: string | undefined, params: HttpRequest): HttpResponse {
+    const contentType =
+      params.headers?.["Content-Type"] ?? params.headers?.["content-type"] ?? "";
+    const boundaryMatch = contentType.match(/boundary=([^;\s]+)/i);
+    if (!boundaryMatch) {
+      return this.jsonResponse(400, { error: { code: 400, message: "Missing multipart boundary" } });
+    }
+    const boundary = boundaryMatch[1];
+    const rawBytes =
+      params.body instanceof ArrayBuffer
+        ? new Uint8Array(params.body)
+        : new TextEncoder().encode(params.body ?? "");
+    const { metadata, fileBytes } = this.parseMultipartRelated(rawBytes, boundary);
+    this.multipartUploadCount += 1;
+    return this.upsertUploadedFile(fileId, metadata, fileBytes);
+  }
+
+  private handleResumableInit(fileId: string | undefined, params: HttpRequest): HttpResponse {
+    const metadata = JSON.parse(typeof params.body === "string" ? params.body : "{}") as {
+      name?: string;
+      mimeType?: string;
+      parents?: string[];
+    };
+    const sessionId = `session-${++this.sessionCounter}`;
+    this.resumableSessions.set(sessionId, {
+      fileId,
+      name: metadata.name,
+      mimeType: metadata.mimeType,
+      parents: metadata.parents,
+    });
+    return {
+      status: 200,
+      headers: {
+        location: `https://www.googleapis.com/upload/drive/v3/sessions/${sessionId}`,
+        "content-type": "application/json",
+      },
+      text: "",
+      json: null,
+      arrayBuffer: new ArrayBuffer(0),
+    };
+  }
+
+  private handleResumablePut(sessionId: string, params: HttpRequest): HttpResponse {
+    const session = this.resumableSessions.get(sessionId);
+    if (!session) {
+      return this.jsonResponse(404, { error: { code: 404, message: "Upload session not found" } });
+    }
+    this.resumableSessions.delete(sessionId);
+    const fileBytes =
+      params.body instanceof ArrayBuffer
+        ? new Uint8Array(params.body.slice(0))
+        : new TextEncoder().encode(params.body ?? "");
+    this.resumableUploadCount += 1;
+    return this.upsertUploadedFile(
+      session.fileId,
+      { name: session.name, mimeType: session.mimeType, parents: session.parents },
+      fileBytes,
+    );
+  }
+
+  private upsertUploadedFile(
+    fileId: string | undefined,
+    metadata: { name?: string; mimeType?: string; parents?: string[] },
+    fileBytes: Uint8Array,
+  ): HttpResponse {
+    const modifiedTime = new Date(this.nowFn()).toISOString();
+    const md5 = this.fakeMd5(fileBytes);
+    if (fileId) {
+      const existing = this.items.get(fileId);
+      if (!existing || existing.trashed) {
+        return this.jsonResponse(404, { error: { code: 404, message: "File not found" } });
+      }
+      if (metadata.name !== undefined) existing.name = metadata.name;
+      existing.content = fileBytes.slice();
+      existing.md5Checksum = md5;
+      existing.modifiedTime = modifiedTime;
+      return this.jsonResponse(200, this.toMetadataDto(existing));
+    }
+
+    const id = `drive-item-${++this.itemCounter}`;
+    const item: FakeDriveItem = {
+      id,
+      name: metadata.name ?? "untitled",
+      mimeType: metadata.mimeType ?? "application/octet-stream",
+      parents: metadata.parents ?? [],
+      content: fileBytes.slice(),
+      md5Checksum: md5,
+      modifiedTime,
+      trashed: false,
+    };
+    this.items.set(id, item);
+    return this.jsonResponse(200, this.toMetadataDto(item));
+  }
+
+  private fakeMd5(bytes: Uint8Array): string {
+    let h1 = 0x811c9dc5;
+    let h2 = 0x9e3779b9;
+    for (let i = 0; i < bytes.length; i++) {
+      h1 ^= bytes[i];
+      h1 = Math.imul(h1, 0x01000193) >>> 0;
+      h2 ^= bytes[i] + i;
+      h2 = Math.imul(h2, 0x85ebca6b) >>> 0;
+    }
+    return h1.toString(16).padStart(8, "0") + h2.toString(16).padStart(8, "0") + bytes.length.toString(16).padStart(16, "0");
+  }
+
+  private parseMultipartRelated(
+    raw: Uint8Array,
+    boundary: string,
+  ): { metadata: { name?: string; mimeType?: string; parents?: string[] }; fileBytes: Uint8Array } {
+    const enc = new TextEncoder();
+    const delim = enc.encode(`--${boundary}`);
+    const crlfcrlf = enc.encode("\r\n\r\n");
+
+    const findBytes = (haystack: Uint8Array, needle: Uint8Array, from = 0): number => {
+      outer: for (let i = from; i <= haystack.length - needle.length; i++) {
+        for (let j = 0; j < needle.length; j++) {
+          if (haystack[i + j] !== needle[j]) continue outer;
+        }
+        return i;
+      }
+      return -1;
+    };
+
+    const p1 = findBytes(raw, delim, 0);
+    const p1HeaderEnd = findBytes(raw, crlfcrlf, p1 + delim.length);
+    const p2 = findBytes(raw, delim, p1HeaderEnd + crlfcrlf.length);
+    const metaBytes = raw.slice(p1HeaderEnd + crlfcrlf.length, p2 - 2); // strip trailing \r\n
+    const metadata = JSON.parse(new TextDecoder().decode(metaBytes)) as {
+      name?: string;
+      mimeType?: string;
+      parents?: string[];
+    };
+
+    const p2HeaderEnd = findBytes(raw, crlfcrlf, p2 + delim.length);
+    const p3 = findBytes(raw, delim, p2HeaderEnd + crlfcrlf.length);
+    const fileBytes = raw.slice(p2HeaderEnd + crlfcrlf.length, p3 - 2); // strip trailing \r\n
+    return { metadata, fileBytes };
   }
 
   private jsonResponse(status: number, body: unknown): HttpResponse {
