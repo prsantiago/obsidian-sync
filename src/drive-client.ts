@@ -279,6 +279,32 @@ export class GoogleDriveClient {
   }
 
   /**
+   * Moves a Google Drive file or folder to Trash (`trashed: true`).
+   * Treats 404 as already trashed/deleted.
+   */
+  async trashFile(fileId: string): Promise<void> {
+    const res = await this.auth.authorizedRequest({
+      url: `${GOOGLE_DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}?supportsAllDrives=true`,
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ trashed: true }),
+    });
+
+    if (res.status === 404) {
+      return;
+    }
+
+    if (res.status < 200 || res.status >= 300) {
+      throw new DriveApiError(
+        res.status,
+        `Drive trashFile (${fileId}) failed (${res.status}): ${res.text}`,
+      );
+    }
+  }
+
+  /**
    * Uploads a file <= 5 MB using Google Drive's multipart/related upload protocol.
    */
   async uploadFileMultipart(params: {
@@ -310,7 +336,7 @@ export class GoogleDriveClient {
     body.set(fileBytes, preamble.byteLength);
     body.set(epilogue, preamble.byteLength + fileBytes.byteLength);
 
-    const fields = "id,name,mimeType,parents,md5Checksum,modifiedTime,size";
+    const fields = "id,name,mimeType,parents,md5Checksum,modifiedTime,size,trashed";
     const url = params.fileId
       ? `${GOOGLE_DRIVE_UPLOAD_BASE}/files/${encodeURIComponent(params.fileId)}?uploadType=multipart&fields=${encodeURIComponent(fields)}&supportsAllDrives=true`
       : `${GOOGLE_DRIVE_UPLOAD_BASE}/files?uploadType=multipart&fields=${encodeURIComponent(fields)}&supportsAllDrives=true`;
@@ -349,7 +375,7 @@ export class GoogleDriveClient {
       ? { name: params.name }
       : { name: params.name, parents: [params.parentId] };
 
-    const fields = "id,name,mimeType,parents,md5Checksum,modifiedTime,size";
+    const fields = "id,name,mimeType,parents,md5Checksum,modifiedTime,size,trashed";
     const initUrl = params.fileId
       ? `${GOOGLE_DRIVE_UPLOAD_BASE}/files/${encodeURIComponent(params.fileId)}?uploadType=resumable&fields=${encodeURIComponent(fields)}&supportsAllDrives=true`
       : `${GOOGLE_DRIVE_UPLOAD_BASE}/files?uploadType=resumable&fields=${encodeURIComponent(fields)}&supportsAllDrives=true`;

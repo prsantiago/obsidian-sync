@@ -35,6 +35,7 @@ export interface PendingRename {
 export interface PendingQueue {
   upserts: PendingUpsert[];
   renames: PendingRename[];
+  deletes?: string[];
 }
 
 export interface SyncErrorLogEntry {
