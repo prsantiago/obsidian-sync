@@ -1,0 +1,1692 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { SyncPluginCore } from "../src/sync-plugin-core";
+import { InMemoryVaultPort } from "./fakes/in-memory-vault";
+import { FakeGoogleDriveHttp } from "./fakes/fake-drive-http";
+import { CapturedNoticeSink } from "./fakes/notice-sink";
+import type { ConfigBundle, PluginData } from "../src/types";
+
+function makeBundle(overrides: Partial<ConfigBundle> = {}): ConfigBundle {
+  return {
+    clientId: "test-client-id",
+    clientSecret: "test-client-secret",
+    refreshToken: "test-refresh-token",
+    rootFolderId: "root-folder-1",
+    rootFolderName: "gd-sb-chachin",
+    ...overrides,
+  };
+}
+
+describe("Google Drive Sync Plugin (Primary Seam)", () => {
+  let now: number;
+  let vault: InMemoryVaultPort;
+  let http: FakeGoogleDriveHttp;
+  let notices: CapturedNoticeSink;
+  let plugin: SyncPluginCore;
+
+  beforeEach(async () => {
+    now = 1_700_000_000_000;
+    const clock = { now: () => now };
+    vault = new InMemoryVaultPort(clock.now);
+    http = new FakeGoogleDriveHttp(clock.now);
+    notices = new CapturedNoticeSink();
+    plugin = new SyncPluginCore({ vault, http, notice: notices, clock });
+    await plugin.load();
+  });
+
+  afterEach(() => {
+    plugin.unload();
+  });
+
+  describe("Settings configuration bundle import & validation", () => {
+    it("accepts a valid JSON config bundle, persists credentials in private plugin data, and exposes read-only connection info", async () => {
+      const bundle = makeBundle({ clientId: "1234567890-abcdef.apps.googleusercontent.com" });
+      http.validClientId = bundle.clientId;
+
+      await plugin.importConfigBundle(JSON.stringify(bundle));
+
+      const info = plugin.getConnectionInfo();
+      expect(info.connected).toBe(true);
+      expect(info.rootFolderName).toBe("gd-sb-chachin");
+      expect(info.rootFolderId).toBe("root-folder-1");
+      expect(info.credentialStatus).toBe("connected");
+      expect(info.maskedClientId).toBe("1234...com");
+
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.credentials?.clientId).toBe(bundle.clientId);
+      expect(persisted.credentials?.clientSecret).toBe(bundle.clientSecret);
+      expect(persisted.credentials?.refreshToken).toBe(bundle.refreshToken);
+      expect(persisted.credentials?.rootFolderId).toBe("root-folder-1");
+      expect(persisted.credentials?.rootFolderName).toBe("gd-sb-chachin");
+    });
+
+    it("accepts a base64-encoded config bundle", async () => {
+      const bundle = makeBundle();
+      const bytes = new TextEncoder().encode(JSON.stringify(bundle));
+      const base64 = btoa(String.fromCharCode(...bytes));
+
+      await plugin.importConfigBundle(base64);
+
+      const info = plugin.getConnectionInfo();
+      expect(info.connected).toBe(true);
+      expect(info.rootFolderId).toBe("root-folder-1");
+    });
+
+    it("rejects invalid or incomplete config bundles with a clear validation message and does not overwrite existing data", async () => {
+      await expect(plugin.importConfigBundle("not valid json or base64!!!")).rejects.toThrow(
+        /invalid configuration bundle/i,
+      );
+
+      await expect(
+        plugin.importConfigBundle(JSON.stringify({ clientId: "abc", rootFolderId: "" })),
+      ).rejects.toThrow(/missing or empty required fields/i);
+
+      expect(plugin.getConnectionInfo().connected).toBe(false);
+      expect(await vault.loadPluginData()).toBeNull();
+    });
+
+    it("disconnects cleanly, clearing credentials and sync metadata from private plugin data", async () => {
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      expect(plugin.getConnectionInfo().connected).toBe(true);
+
+      await plugin.disconnect();
+
+      expect(plugin.getConnectionInfo()).toEqual({
+        connected: false,
+        rootFolderName: null,
+        rootFolderId: null,
+        maskedClientId: null,
+        credentialStatus: "disconnected",
+      });
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.credentials).toBeNull();
+      expect(persisted.syncIndex).toEqual({});
+      expect(persisted.startPageToken).toBeNull();
+    });
+  });
+
+  describe("OAuth token refresh & 401 retry", () => {
+    it("proactively refreshes expired access tokens before calling Drive API and persists the new token", async () => {
+      http.seedFile({
+        id: "file-1",
+        name: "Hello.md",
+        parentId: "root-folder-1",
+        content: "# Hello",
+      });
+
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      expect(http.tokenRefreshCount).toBe(1);
+      expect(vault.readTextSync("Hello.md")).toBe("# Hello");
+
+      // Advance clock past 1-hour token expiry
+      now += 3_700_000;
+      http.seedFile({
+        id: "file-2",
+        name: "Later.md",
+        parentId: "root-folder-1",
+        content: "# Later",
+      });
+
+      await plugin.initialPull();
+      expect(http.tokenRefreshCount).toBe(2);
+      expect(vault.readTextSync("Later.md")).toBe("# Later");
+
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.credentials?.accessToken).toBe("access-token-2");
+      expect(persisted.credentials?.expiresAt).toBeGreaterThan(now);
+    });
+
+    it("reactively refreshes and retries once on HTTP 401 without user intervention", async () => {
+      http.seedFile({
+        id: "file-1",
+        name: "Retry.md",
+        parentId: "root-folder-1",
+        content: "retried ok",
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      expect(http.tokenRefreshCount).toBe(1);
+
+      // Simulate server rejecting the cached access token with 401
+      http.forceNextDrive401 = true;
+      await plugin.initialPull();
+
+      expect(http.tokenRefreshCount).toBe(2);
+      expect(vault.readTextSync("Retry.md")).toBe("retried ok");
+    });
+
+    it("surfaces a persistent Notice on terminal invalid_grant refresh failure", async () => {
+      http.revokedRefreshToken = true;
+
+      await expect(plugin.importConfigBundle(JSON.stringify(makeBundle()))).rejects.toThrow(
+        /invalid_grant|revoked|auth/i,
+      );
+
+      expect(notices.notices.some((n) => n.durationMs === 0)).toBe(true);
+    });
+  });
+
+  describe("Initial pull, Unicode paths, binary preservation, exclusions & Sync Index", () => {
+    it("pulls nested Unicode folders, markdown notes, and exact binary attachments, and persists Sync Index + startPageToken in private plugin data", async () => {
+      const binaryPng = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff]);
+      http.setStartPageToken("4242");
+
+      http.seedFolder("folder-areas", "02 - Áreas", "root-folder-1", "2026-02-01T10:00:00.000Z");
+      http.seedFolder("folder-sub", "Salud & Nutrición", "folder-areas", "2026-02-01T10:05:00.000Z");
+      http.seedFile({
+        id: "note-root",
+        name: "Index.md",
+        parentId: "root-folder-1",
+        content: "# Vault Root\nWelcome!",
+        md5Checksum: "abc123",
+        modifiedTime: "2026-02-02T12:00:00.000Z",
+      });
+      http.seedFile({
+        id: "note-nested",
+        name: "Planificación.md",
+        parentId: "folder-sub",
+        content: "# Planificación\n- Día 1: café",
+        md5Checksum: "def456",
+        modifiedTime: "2026-02-03T15:30:00.000Z",
+      });
+      http.seedFile({
+        id: "img-1",
+        name: "diagram.png",
+        parentId: "folder-areas",
+        mimeType: "image/png",
+        content: binaryPng,
+        md5Checksum: "png999",
+        modifiedTime: "2026-02-04T08:00:00.000Z",
+      });
+
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+
+      // Verify local vault files and exact binary content
+      expect(vault.listAllFilePaths()).toEqual([
+        "02 - Áreas/Salud & Nutrición/Planificación.md",
+        "02 - Áreas/diagram.png",
+        "Index.md",
+      ]);
+      expect(vault.readTextSync("Index.md")).toBe("# Vault Root\nWelcome!");
+      expect(vault.readTextSync("02 - Áreas/Salud & Nutrición/Planificación.md")).toBe(
+        "# Planificación\n- Día 1: café",
+      );
+      expect(vault.readBytesSync("02 - Áreas/diagram.png")).toEqual(binaryPng);
+
+      // Verify Sync Index and startPageToken are persisted in private plugin data (not in vault files)
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.startPageToken).toBe("4242");
+      expect(persisted.syncIndex["Index.md"]).toEqual({
+        path: "Index.md",
+        driveId: "note-root",
+        parentId: "root-folder-1",
+        md5Checksum: "abc123",
+        localMtime: now,
+        remoteModifiedTime: "2026-02-02T12:00:00.000Z",
+        type: "file",
+      });
+      expect(persisted.syncIndex["02 - Áreas"]).toEqual({
+        path: "02 - Áreas",
+        driveId: "folder-areas",
+        parentId: "root-folder-1",
+        md5Checksum: null,
+        localMtime: 0,
+        remoteModifiedTime: "2026-02-01T10:00:00.000Z",
+        type: "folder",
+      });
+      expect(persisted.syncIndex["02 - Áreas/diagram.png"]).toEqual({
+        path: "02 - Áreas/diagram.png",
+        driveId: "img-1",
+        parentId: "folder-areas",
+        md5Checksum: "png999",
+        localMtime: now,
+        remoteModifiedTime: "2026-02-04T08:00:00.000Z",
+        type: "file",
+      });
+
+      // Verify a fresh plugin instance loading from persisted plugin data retains connection info
+      const reloaded = new SyncPluginCore({ vault, http, notice: notices });
+      await reloaded.load();
+      expect(reloaded.getConnectionInfo().connected).toBe(true);
+      expect(reloaded.getConnectionInfo().rootFolderName).toBe("gd-sb-chachin");
+    });
+
+    it("excludes .obsidian/, .trash/, .DS_Store (root & nested), trashed items, and Google Workspace native files", async () => {
+      http.seedFolder("obs-dir", ".obsidian", "root-folder-1");
+      http.seedFile({
+        id: "obs-cfg",
+        name: "app.json",
+        parentId: "obs-dir",
+        content: "{}",
+      });
+      http.seedFolder("trash-dir", ".trash", "root-folder-1");
+      http.seedFile({
+        id: "trash-note",
+        name: "deleted.md",
+        parentId: "trash-dir",
+        content: "old",
+      });
+      http.seedFile({
+        id: "ds-root",
+        name: ".DS_Store",
+        parentId: "root-folder-1",
+        content: "junk",
+      });
+      http.seedFolder("notes-dir", "Notes", "root-folder-1");
+      http.seedFile({
+        id: "ds-nested",
+        name: ".DS_Store",
+        parentId: "notes-dir",
+        content: "junk",
+      });
+      http.seedFile({
+        id: "gdoc-1",
+        name: "Meeting Notes",
+        parentId: "notes-dir",
+        mimeType: "application/vnd.google-apps.document",
+      });
+      http.seedFile({
+        id: "gsheet-1",
+        name: "Budget",
+        parentId: "root-folder-1",
+        mimeType: "application/vnd.google-apps.spreadsheet",
+      });
+      http.seedFile({
+        id: "trashed-1",
+        name: "Trashed.md",
+        parentId: "root-folder-1",
+        content: "nope",
+        trashed: true,
+      });
+      http.seedFile({
+        id: "valid-1",
+        name: "Valid.md",
+        parentId: "notes-dir",
+        content: "keep me",
+      });
+
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+
+      expect(vault.listAllFilePaths()).toEqual(["Notes/Valid.md"]);
+      expect(vault.listAllFolderPaths()).toEqual(["Notes"]);
+
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(Object.keys(persisted.syncIndex).sort()).toEqual(["Notes", "Notes/Valid.md"]);
+    });
+
+    it("handles paginated Drive files.list responses across multiple pages", async () => {
+      http.defaultPageSize = 2;
+      for (let i = 1; i <= 5; i++) {
+        http.seedFile({
+          id: `f-${i}`,
+          name: `Note-${i}.md`,
+          parentId: "root-folder-1",
+          content: `content ${i}`,
+        });
+      }
+
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+
+      expect(vault.listAllFilePaths()).toEqual([
+        "Note-1.md",
+        "Note-2.md",
+        "Note-3.md",
+        "Note-4.md",
+        "Note-5.md",
+      ]);
+    });
+  });
+
+  describe("Delta pull on cold start, foreground resume & 30-second polling", () => {
+    it("pulls remote creates, new folders, and edits via changes.list on cold start (load) and updates startPageToken + Sync Index", async () => {
+      http.seedFile({
+        id: "f-1",
+        name: "Existing.md",
+        parentId: "root-folder-1",
+        content: "v1",
+        md5Checksum: "md5-v1",
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      const initialData = (await vault.loadPluginData()) as PluginData;
+      const initialToken = initialData.startPageToken!;
+      expect(vault.readTextSync("Existing.md")).toBe("v1");
+
+      // Simulate app restart (cold start): create a fresh plugin instance against same vault & http
+      http.seedFolder("dir-new", "02 - Áreas", "root-folder-1");
+      http.seedFile({
+        id: "f-2",
+        name: "NewNote.md",
+        parentId: "dir-new",
+        content: "created while closed",
+        md5Checksum: "md5-new-1",
+      });
+      http.seedFile({
+        id: "f-1",
+        name: "Existing.md",
+        parentId: "root-folder-1",
+        content: "v2 from macOS",
+        md5Checksum: "md5-v2",
+        modifiedTime: "2026-01-02T00:00:00.000Z",
+      });
+
+      const restartedPlugin = new SyncPluginCore({
+        vault,
+        http,
+        notice: notices,
+        clock: { now: () => now },
+      });
+      await restartedPlugin.load();
+
+      expect(vault.readTextSync("Existing.md")).toBe("v2 from macOS");
+      expect(vault.readTextSync("02 - Áreas/NewNote.md")).toBe("created while closed");
+
+      const updatedData = (await vault.loadPluginData()) as PluginData;
+      expect(updatedData.startPageToken).not.toBe(initialToken);
+      expect(updatedData.syncIndex["Existing.md"]?.md5Checksum).toBe("md5-v2");
+      expect(updatedData.syncIndex["02 - Áreas"]?.type).toBe("folder");
+      expect(updatedData.syncIndex["02 - Áreas/NewNote.md"]?.driveId).toBe("f-2");
+      restartedPlugin.unload();
+    });
+
+    it("polls every 30s while visible, pauses when hidden, and pulls immediately on visibilitychange: visible", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(now);
+        await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+
+        // 1. Remote edit arrives; advance 30s -> pulled automatically
+        http.seedFile({
+          id: "f-poll-1",
+          name: "Polled.md",
+          parentId: "root-folder-1",
+          content: "polled at 30s",
+          md5Checksum: "md5-poll-1",
+        });
+
+        await vi.advanceTimersByTimeAsync(29_999);
+        expect(await vault.exists("Polled.md")).toBe(false);
+
+        await vi.advanceTimersByTimeAsync(1);
+        expect(vault.readTextSync("Polled.md")).toBe("polled at 30s");
+
+        // 2. App becomes hidden -> polling pauses
+        await plugin.handleVisibilityChange(false);
+        http.seedFile({
+          id: "f-poll-2",
+          name: "WhileHidden.md",
+          parentId: "root-folder-1",
+          content: "should wait until visible",
+          md5Checksum: "md5-poll-2",
+        });
+
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(await vault.exists("WhileHidden.md")).toBe(false);
+
+        // 3. App returns to foreground (visible) -> immediate pull + resumes 30s polling
+        await plugin.handleVisibilityChange(true);
+        expect(vault.readTextSync("WhileHidden.md")).toBe("should wait until visible");
+
+        http.seedFile({
+          id: "f-poll-3",
+          name: "ResumedPoll.md",
+          parentId: "root-folder-1",
+          content: "polled after resume",
+          md5Checksum: "md5-poll-3",
+        });
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(vault.readTextSync("ResumedPoll.md")).toBe("polled after resume");
+      } finally {
+        plugin.unload();
+        vi.useRealTimers();
+      }
+    });
+
+    it("skips changes outside root subtree, ignored paths, Google Workspace native files, and unchanged MD5 files", async () => {
+      http.seedFile({
+        id: "f-keep",
+        name: "Keep.md",
+        parentId: "root-folder-1",
+        content: "unchanged body",
+        md5Checksum: "md5-same",
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      http.downloadedFileIds = [];
+
+      // Seed changes outside root subtree, ignored paths, native Docs, and metadata-only touch (same MD5)
+      http.seedFolder("other-root", "OtherFolder", "my-drive-root");
+      http.seedFile({
+        id: "outside-1",
+        name: "Secret.md",
+        parentId: "other-root",
+        content: "outside",
+      });
+      http.seedFolder("obs-dir", ".obsidian", "root-folder-1");
+      http.seedFile({
+        id: "obs-1",
+        name: "app.json",
+        parentId: "obs-dir",
+        content: "{}",
+      });
+      http.seedFile({
+        id: "ds-1",
+        name: ".DS_Store",
+        parentId: "root-folder-1",
+        content: "junk",
+      });
+      http.seedFolder("trash-dir", ".trash", "root-folder-1");
+      http.seedFile({
+        id: "trash-1",
+        name: "Deleted.md",
+        parentId: "trash-dir",
+        content: "trashed",
+      });
+      http.seedFile({
+        id: "gdoc-1",
+        name: "Roadmap",
+        parentId: "root-folder-1",
+        mimeType: "application/vnd.google-apps.document",
+      });
+      // Metadata-only update with identical MD5
+      http.seedFile({
+        id: "f-keep",
+        name: "Keep.md",
+        parentId: "root-folder-1",
+        content: "unchanged body",
+        md5Checksum: "md5-same",
+        modifiedTime: "2026-01-03T00:00:00.000Z",
+      });
+
+      await plugin.pullDelta();
+
+      expect(vault.listAllFilePaths()).toEqual(["Keep.md"]);
+      expect(vault.listAllFolderPaths()).toEqual([]);
+      expect(http.downloadedFileIds).toEqual([]);
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.syncIndex["Keep.md"]?.remoteModifiedTime).toBe("2026-01-03T00:00:00.000Z");
+    });
+
+    it("handles remote file/folder renames and moves within, into, and out of synced root subtree without orphaned duplicates", async () => {
+      http.seedFolder("dir-a", "FolderA", "root-folder-1");
+      http.seedFolder("dir-b", "FolderB", "root-folder-1");
+      http.seedFile({
+        id: "f-a1",
+        name: "Alpha.md",
+        parentId: "dir-a",
+        content: "alpha body",
+        md5Checksum: "md5-alpha",
+      });
+      http.seedFile({
+        id: "f-move-out",
+        name: "LeaveRoot.md",
+        parentId: "root-folder-1",
+        content: "leaving",
+        md5Checksum: "md5-leave",
+      });
+      // External folder outside root-folder-1 with an existing child
+      http.seedFolder("ext-dir", "ImportedProject", "my-drive-root");
+      http.seedFile({
+        id: "ext-file",
+        name: "Spec.md",
+        parentId: "ext-dir",
+        content: "external spec",
+        md5Checksum: "md5-ext",
+      });
+
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      http.downloadedFileIds = [];
+
+      // 1. Rename FolderA -> FolderA-Renamed (moves Alpha.md with it)
+      http.renameOrMoveItem("dir-a", { name: "FolderA-Renamed" });
+      // 2. Move Alpha.md into FolderB and rename to AlphaMoved.md (same content/MD5)
+      http.renameOrMoveItem("f-a1", { name: "AlphaMoved.md", parentId: "dir-b" });
+      // 3. Move external folder ImportedProject INTO root-folder-1
+      http.renameOrMoveItem("ext-dir", { parentId: "root-folder-1" });
+      // 4. Move LeaveRoot.md OUT of root-folder-1 into my-drive-root
+      http.renameOrMoveItem("f-move-out", { parentId: "my-drive-root" });
+
+      await plugin.pullDelta();
+
+      expect(vault.listAllFilePaths()).toEqual([
+        "FolderB/AlphaMoved.md",
+        "ImportedProject/Spec.md",
+      ]);
+      expect(vault.readTextSync("FolderB/AlphaMoved.md")).toBe("alpha body");
+      expect(vault.readTextSync("ImportedProject/Spec.md")).toBe("external spec");
+      // AlphaMoved.md had same MD5, so only ext-file should have been downloaded
+      expect(http.downloadedFileIds).toEqual(["ext-file"]);
+
+      expect(vault.listAllFolderPaths()).toEqual([
+        "FolderA-Renamed",
+        "FolderB",
+        "ImportedProject",
+      ]);
+
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(Object.keys(persisted.syncIndex).sort()).toEqual([
+        "FolderA-Renamed",
+        "FolderB",
+        "FolderB/AlphaMoved.md",
+        "ImportedProject",
+        "ImportedProject/Spec.md",
+      ]);
+      expect(persisted.syncIndex["FolderA"]).toBeUndefined();
+      expect(persisted.syncIndex["FolderA/Alpha.md"]).toBeUndefined();
+      expect(persisted.syncIndex["LeaveRoot.md"]).toBeUndefined();
+    });
+
+    it("falls back to full Drive subtree reconciliation when startPageToken is expired (HTTP 410) and persists a fresh token", async () => {
+      http.seedFile({
+        id: "f-1",
+        name: "Keep.md",
+        parentId: "root-folder-1",
+        content: "v1",
+        md5Checksum: "md5-1",
+      });
+      http.seedFile({
+        id: "f-stale",
+        name: "MovedOutWhileExpired.md",
+        parentId: "root-folder-1",
+        content: "stale",
+        md5Checksum: "md5-stale",
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      const oldData = (await vault.loadPluginData()) as PluginData;
+      const expiredToken = oldData.startPageToken!;
+
+      // Expire the stored token and mutate Drive state
+      http.expirePageToken(expiredToken);
+      http.renameOrMoveItem("f-stale", { parentId: "other-root" });
+      http.seedFile({
+        id: "f-new",
+        name: "Recovered.md",
+        parentId: "root-folder-1",
+        content: "recovered after 410",
+        md5Checksum: "md5-rec",
+      });
+      http.setStartPageToken("9999");
+
+      await plugin.pullDelta();
+
+      expect(vault.listAllFilePaths()).toEqual(["Keep.md", "Recovered.md"]);
+      expect(vault.readTextSync("Recovered.md")).toBe("recovered after 410");
+      const freshData = (await vault.loadPluginData()) as PluginData;
+      expect(freshData.startPageToken).toBe("9999");
+      expect(freshData.syncIndex["MovedOutWhileExpired.md"]).toBeUndefined();
+      expect(freshData.syncIndex["Recovered.md"]?.driveId).toBe("f-new");
+    });
+
+    it("preserves unpushed local edits & pending deletes and resolves edit-vs-edit conflicts during HTTP 410 full subtree reconciliation", async () => {
+      http.seedFile({
+        id: "f-410-conflict",
+        name: "Conflict410.md",
+        parentId: "root-folder-1",
+        content: "baseline",
+        modifiedTime: new Date(now).toISOString(),
+      });
+      http.seedFile({
+        id: "f-410-local-only",
+        name: "UnpushedLocalEdit410.md",
+        parentId: "root-folder-1",
+        content: "baseline",
+        modifiedTime: new Date(now).toISOString(),
+      });
+      http.seedFile({
+        id: "f-410-del",
+        name: "PendingDelete410.md",
+        parentId: "root-folder-1",
+        content: "to be deleted locally",
+        modifiedTime: new Date(now).toISOString(),
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      const oldData = (await vault.loadPluginData()) as PluginData;
+      http.expirePageToken(oldData.startPageToken!);
+
+      // Remote edits Conflict410.md
+      now += 10_000;
+      http.updateFileContent("f-410-conflict", "remote edit during 410");
+
+      // Local edits Conflict410.md (newer), edits UnpushedLocalEdit410.md, and deletes PendingDelete410.md
+      now += 20_000;
+      await vault.writeBinary(
+        "Conflict410.md",
+        new TextEncoder().encode("local edit newer during 410").buffer,
+      );
+      plugin.onVaultModify("Conflict410.md");
+
+      await vault.writeBinary(
+        "UnpushedLocalEdit410.md",
+        new TextEncoder().encode("unpushed local edit").buffer,
+      );
+      plugin.onVaultModify("UnpushedLocalEdit410.md");
+
+      await vault.remove("PendingDelete410.md");
+      plugin.onVaultDelete("PendingDelete410.md");
+
+      // Trigger pullDelta() before push flushes -> hits HTTP 410 -> reconcileFullSubtree()
+      await plugin.pullDelta();
+
+      // 1. Conflict410.md resolved as edit-vs-edit conflict without losing local edit
+      expect(vault.readTextSync("Conflict410.md")).toBe("local edit newer during 410");
+      const conflictCopies = vault
+        .listAllFilePaths()
+        .filter((p) => p.startsWith("Conflict410 (conflict"));
+      expect(conflictCopies).toHaveLength(1);
+      expect(vault.readTextSync(conflictCopies[0])).toBe("remote edit during 410");
+
+      // 2. UnpushedLocalEdit410.md preserved locally
+      expect(vault.readTextSync("UnpushedLocalEdit410.md")).toBe("unpushed local edit");
+
+      // 3. PendingDelete410.md NOT resurrected locally
+      expect(await vault.exists("PendingDelete410.md")).toBe(false);
+
+      // 4. Flushing pending push uploads UnpushedLocalEdit410.md and trashes PendingDelete410.md on Drive
+      await plugin.flushPendingPush();
+      expect(
+        new TextDecoder().decode(http.getItem("f-410-local-only")?.content),
+      ).toBe("unpushed local edit");
+      expect(http.getItem("f-410-del")?.trashed).toBe(true);
+    });
+
+    it("suppresses push echo loops on pulled writes and renames and issues zero Drive write requests", async () => {
+      http.seedFile({
+        id: "f-echo",
+        name: "Original.md",
+        parentId: "root-folder-1",
+        content: "v1",
+        md5Checksum: "md5-1",
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      http.driveRequests = [];
+
+      http.renameOrMoveItem("f-echo", { name: "Renamed.md" });
+      http.seedFile({
+        id: "f-echo-new",
+        name: "PulledWrite.md",
+        parentId: "root-folder-1",
+        content: "from drive",
+        md5Checksum: "md5-2",
+      });
+
+      await plugin.pullDelta();
+
+      // Zero non-GET (upload/mutation) requests to Drive
+      expect(http.driveRequests.filter((r) => r.method !== "GET")).toEqual([]);
+
+      // Pulled/renamed paths are echo-suppressed; unrelated paths are not
+      expect(plugin.isEchoSuppressed("PulledWrite.md")).toBe(true);
+      expect(plugin.isEchoSuppressed("Original.md")).toBe(true);
+      expect(plugin.isEchoSuppressed("Renamed.md")).toBe(true);
+      expect(plugin.isEchoSuppressed("UnrelatedLocalEdit.md")).toBe(false);
+
+      // Suppression expires after the echo window
+      now += 5_000;
+      expect(plugin.isEchoSuppressed("PulledWrite.md")).toBe(false);
+    });
+  });
+
+  describe("Automatic near-instant push & app-switch flush", () => {
+    beforeEach(async () => {
+      vi.useFakeTimers();
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+    });
+
+    afterEach(() => {
+      plugin.dispose();
+      vi.useRealTimers();
+    });
+
+    it("pushes a newly created markdown note to Google Drive ~500ms after the vault create event and updates Sync Index", async () => {
+      await vault.writeBinary("Daily.md", new TextEncoder().encode("# Hello Drive").buffer);
+      plugin.onVaultCreate("Daily.md", "file");
+
+      // Before 500ms, it has not been uploaded yet
+      await vi.advanceTimersByTimeAsync(400);
+      expect(http.findItemByName("Daily.md", "root-folder-1")).toBeUndefined();
+
+      // At 500ms, debounce fires and uploads via multipart
+      await vi.advanceTimersByTimeAsync(100);
+      const remote = http.findItemByName("Daily.md", "root-folder-1");
+      expect(remote).toBeDefined();
+      expect(new TextDecoder().decode(remote!.content)).toBe("# Hello Drive");
+      expect(http.multipartUploadCount).toBe(1);
+
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.syncIndex["Daily.md"]).toMatchObject({
+        path: "Daily.md",
+        driveId: remote!.id,
+        parentId: "root-folder-1",
+        md5Checksum: remote!.md5Checksum,
+        remoteModifiedTime: remote!.modifiedTime,
+        type: "file",
+      });
+    });
+
+    it("coalesces rapid consecutive edits within the 500ms debounce window into a single upload", async () => {
+      http.seedFile({
+        id: "existing-note",
+        name: "Journal.md",
+        parentId: "root-folder-1",
+        content: "v0",
+      });
+      // Re-run initial pull to track Journal.md
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      now += 3_000;
+
+      await vault.writeBinary("Journal.md", new TextEncoder().encode("v1").buffer);
+      plugin.onVaultModify("Journal.md");
+      await vi.advanceTimersByTimeAsync(250);
+
+      await vault.writeBinary("Journal.md", new TextEncoder().encode("v2").buffer);
+      plugin.onVaultModify("Journal.md");
+      await vi.advanceTimersByTimeAsync(250);
+
+      // Still hasn't fired because second edit reset the 500ms timer
+      expect(http.multipartUploadCount).toBe(0);
+
+      await vault.writeBinary("Journal.md", new TextEncoder().encode("v3-final").buffer);
+      plugin.onVaultModify("Journal.md");
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(http.multipartUploadCount).toBe(1);
+      const remote = http.getItem("existing-note");
+      expect(new TextDecoder().decode(remote!.content)).toBe("v3-final");
+    });
+
+    it("creates nested Drive folders on demand and uploads binary attachments byte-for-byte", async () => {
+      const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff]);
+      await vault.mkdir("Projects/2026/Assets");
+      plugin.onVaultCreate("Projects", "folder");
+      plugin.onVaultCreate("Projects/2026", "folder");
+      plugin.onVaultCreate("Projects/2026/Assets", "folder");
+      await vault.writeBinary("Projects/2026/Assets/diagram.png", pngBytes.buffer);
+      plugin.onVaultCreate("Projects/2026/Assets/diagram.png", "file");
+
+      await vi.advanceTimersByTimeAsync(500);
+
+      const projectsFolder = http.findItemByName("Projects", "root-folder-1");
+      expect(projectsFolder).toBeDefined();
+      const yearFolder = http.findItemByName("2026", projectsFolder!.id);
+      expect(yearFolder).toBeDefined();
+      const assetsFolder = http.findItemByName("Assets", yearFolder!.id);
+      expect(assetsFolder).toBeDefined();
+      const remotePng = http.findItemByName("diagram.png", assetsFolder!.id);
+      expect(remotePng).toBeDefined();
+      expect(remotePng!.content).toEqual(pngBytes);
+
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.syncIndex["Projects/2026/Assets"]?.driveId).toBe(assetsFolder!.id);
+      expect(persisted.syncIndex["Projects/2026/Assets/diagram.png"]?.parentId).toBe(
+        assetsFolder!.id,
+      );
+    });
+
+    it("uses multipart upload for files <= 5 MB and resumable upload for files > 5 MB with byte-for-byte fidelity", async () => {
+      const fiveMb = 5 * 1024 * 1024;
+      const exact5Mb = new Uint8Array(fiveMb);
+      exact5Mb[0] = 0x11;
+      exact5Mb[fiveMb - 1] = 0x22;
+
+      const over5Mb = new Uint8Array(fiveMb + 1);
+      over5Mb[0] = 0xaa;
+      over5Mb[fiveMb] = 0xbb;
+
+      await vault.writeBinary("exact-5mb.bin", exact5Mb.buffer);
+      plugin.onVaultCreate("exact-5mb.bin", "file");
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(http.multipartUploadCount).toBe(1);
+      expect(http.resumableUploadCount).toBe(0);
+      const remoteExact = http.findItemByName("exact-5mb.bin", "root-folder-1");
+      expect(remoteExact!.content!.byteLength).toBe(fiveMb);
+      expect(remoteExact!.content![0]).toBe(0x11);
+      expect(remoteExact!.content![fiveMb - 1]).toBe(0x22);
+
+      await vault.writeBinary("large-video.bin", over5Mb.buffer);
+      plugin.onVaultCreate("large-video.bin", "file");
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(http.multipartUploadCount).toBe(1);
+      expect(http.resumableUploadCount).toBe(1);
+      const remoteLarge = http.findItemByName("large-video.bin", "root-folder-1");
+      expect(remoteLarge!.content!.byteLength).toBe(fiveMb + 1);
+      expect(remoteLarge!.content![0]).toBe(0xaa);
+      expect(remoteLarge!.content![fiveMb]).toBe(0xbb);
+    });
+
+    it("renames and moves files and folders on Drive without leaving duplicate ghost files", async () => {
+      http.seedFolder("dir-a", "Inbox", "root-folder-1");
+      http.seedFolder("dir-b", "Archive", "root-folder-1");
+      http.seedFile({
+        id: "note-1",
+        name: "Draft.md",
+        parentId: "dir-a",
+        content: "hello",
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      now += 3_000;
+
+      // Move and rename Draft.md -> Archive/Published.md
+      vault.simulateRename("Inbox/Draft.md", "Archive/Published.md");
+      plugin.onVaultRename("Inbox/Draft.md", "Archive/Published.md", "file");
+      await vi.advanceTimersByTimeAsync(500);
+
+      const movedNote = http.getItem("note-1");
+      expect(movedNote?.name).toBe("Published.md");
+      expect(movedNote?.parents).toEqual(["dir-b"]);
+      expect(http.findItemByName("Draft.md", "dir-a")).toBeUndefined();
+
+      // Rename folder Archive -> Done (updating descendant Sync Index paths too)
+      vault.simulateRename("Archive", "Done");
+      plugin.onVaultRename("Archive", "Done", "folder");
+      await vi.advanceTimersByTimeAsync(500);
+
+      const renamedFolder = http.getItem("dir-b");
+      expect(renamedFolder?.name).toBe("Done");
+      expect(renamedFolder?.parents).toEqual(["root-folder-1"]);
+      expect(http.listAllItems().filter((i) => i.name === "Published.md")).toHaveLength(1);
+
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.syncIndex["Inbox/Draft.md"]).toBeUndefined();
+      expect(persisted.syncIndex["Archive"]).toBeUndefined();
+      expect(persisted.syncIndex["Archive/Published.md"]).toBeUndefined();
+      expect(persisted.syncIndex["Done"]?.driveId).toBe("dir-b");
+      expect(persisted.syncIndex["Done/Published.md"]?.driveId).toBe("note-1");
+    });
+
+    it("cancels the debounce timer and immediately flushes pending changes on visibilitychange: hidden", async () => {
+      await vault.writeBinary("QuickNote.md", new TextEncoder().encode("before lock").buffer);
+      plugin.onVaultCreate("QuickNote.md", "file");
+
+      // Only 50ms elapsed, timer hasn't fired
+      await vi.advanceTimersByTimeAsync(50);
+      expect(http.findItemByName("QuickNote.md", "root-folder-1")).toBeUndefined();
+
+      // App switches away / screen locks -> immediate flush
+      await plugin.onVisibilityHidden();
+      expect(http.findItemByName("QuickNote.md", "root-folder-1")).toBeDefined();
+      expect(http.multipartUploadCount).toBe(1);
+
+      // Advancing past the original 500ms window does NOT trigger a duplicate upload
+      await vi.advanceTimersByTimeAsync(500);
+      expect(http.multipartUploadCount).toBe(1);
+    });
+
+    it("flushes pending changes and pulls remote changes immediately when syncNow() command is triggered", async () => {
+      await vault.writeBinary("ManualSync.md", new TextEncoder().encode("sync me").buffer);
+      plugin.onVaultCreate("ManualSync.md", "file");
+
+      http.seedFile({
+        id: "remote-syncnow-1",
+        name: "FromRemoteOnSyncNow.md",
+        parentId: "root-folder-1",
+        content: "pulled by syncNow",
+      });
+
+      await plugin.syncNow();
+      expect(http.findItemByName("ManualSync.md", "root-folder-1")).toBeDefined();
+      expect(http.multipartUploadCount).toBe(1);
+      expect(vault.readTextSync("FromRemoteOnSyncNow.md")).toBe("pulled by syncNow");
+
+      await vi.advanceTimersByTimeAsync(500);
+      expect(http.multipartUploadCount).toBe(1);
+    });
+
+    it("ignores local changes under .obsidian/, .trash/, and any .DS_Store", async () => {
+      await vault.writeBinary(".obsidian/workspace.json", new TextEncoder().encode("{}").buffer);
+      await vault.writeBinary(".trash/deleted.md", new TextEncoder().encode("trash").buffer);
+      await vault.writeBinary(".DS_Store", new Uint8Array([1, 2, 3]).buffer);
+      await vault.writeBinary("Notes/.DS_Store", new Uint8Array([4, 5, 6]).buffer);
+
+      plugin.onVaultCreate(".obsidian/workspace.json", "file");
+      plugin.onVaultModify(".obsidian/workspace.json");
+      plugin.onVaultCreate(".trash/deleted.md", "file");
+      plugin.onVaultCreate(".DS_Store", "file");
+      plugin.onVaultCreate("Notes/.DS_Store", "file");
+
+      await vi.advanceTimersByTimeAsync(500);
+      expect(http.multipartUploadCount).toBe(0);
+      expect(http.listAllItems()).toHaveLength(0);
+    });
+
+    it("serializes concurrent sync triggers via a single-flight lock with a follow-up pass", async () => {
+      await vault.writeBinary("A.md", new TextEncoder().encode("first").buffer);
+      plugin.onVaultCreate("A.md", "file");
+
+      // Gate the first HTTP upload so we can trigger a concurrent sync while it is in flight
+      let releaseFirstUpload!: () => void;
+      const firstUploadGate = new Promise<void>((resolve) => {
+        releaseFirstUpload = resolve;
+      });
+      let inFlightUploads = 0;
+      let maxConcurrentUploads = 0;
+      const origRequest = http.request.bind(http);
+      const requestSpy = vi.spyOn(http, "request").mockImplementation(async (params) => {
+        if (params.url.includes("/upload/drive/v3/files")) {
+          inFlightUploads += 1;
+          maxConcurrentUploads = Math.max(maxConcurrentUploads, inFlightUploads);
+          if (http.multipartUploadCount === 0) {
+            await firstUploadGate;
+          }
+          try {
+            return await origRequest(params);
+          } finally {
+            inFlightUploads -= 1;
+          }
+        }
+        return origRequest(params);
+      });
+
+      const firstSync = plugin.syncNow();
+      // Yield microtasks so firstSync reaches the upload gate
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // Queue another local change and trigger a concurrent syncNow while firstSync is in flight
+      await vault.writeBinary("B.md", new TextEncoder().encode("second").buffer);
+      plugin.onVaultCreate("B.md", "file");
+      const secondSync = plugin.syncNow();
+
+      // Release the first upload and await both sync calls
+      releaseFirstUpload();
+      await Promise.all([firstSync, secondSync]);
+      requestSpy.mockRestore();
+
+      expect(maxConcurrentUploads).toBe(1);
+      expect(http.findItemByName("A.md", "root-folder-1")).toBeDefined();
+      expect(http.findItemByName("B.md", "root-folder-1")).toBeDefined();
+    });
+
+    it("suppresses echo pushes for plugin-initiated local writes during pull", async () => {
+      http.seedFile({
+        id: "remote-1",
+        name: "FromMac.md",
+        parentId: "root-folder-1",
+        content: "mac content",
+      });
+
+      // Simulate Obsidian emitting vault create/modify events whenever writeBinary/mkdir runs
+      const origWrite = vault.writeBinary.bind(vault);
+      const writeSpy = vi.spyOn(vault, "writeBinary").mockImplementation(async (path, data) => {
+        const st = await origWrite(path, data);
+        plugin.onVaultCreate(path, "file");
+        plugin.onVaultModify(path);
+        return st;
+      });
+
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      writeSpy.mockRestore();
+
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(http.multipartUploadCount).toBe(0);
+    });
+
+    it("suppresses echo pushes when vault emits create, modify, rename, or delete events during delta pull", async () => {
+      http.seedFolder("dir-orig", "OrigFolder", "root-folder-1");
+      http.seedFile({
+        id: "f-rename",
+        name: "BeforeRename.md",
+        parentId: "dir-orig",
+        content: "hello",
+      });
+      http.seedFile({
+        id: "f-move-out",
+        name: "MovedOut.md",
+        parentId: "root-folder-1",
+        content: "bye",
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      now += 3_000;
+
+      // Wire vault methods to emit create/modify/rename/delete events as Obsidian does
+      const origMkdir = vault.mkdir.bind(vault);
+      const mkdirSpy = vi.spyOn(vault, "mkdir").mockImplementation(async (p) => {
+        await origMkdir(p);
+        plugin.onVaultCreate(p, "folder");
+      });
+      const origWrite = vault.writeBinary.bind(vault);
+      const writeSpy = vi.spyOn(vault, "writeBinary").mockImplementation(async (p, d) => {
+        const st = await origWrite(p, d);
+        plugin.onVaultCreate(p, "file");
+        plugin.onVaultModify(p);
+        return st;
+      });
+      const origRename = vault.rename.bind(vault);
+      const renameSpy = vi.spyOn(vault, "rename").mockImplementation(async (oldP, newP) => {
+        const st = await vault.stat(oldP);
+        await origRename(oldP, newP);
+        plugin.onVaultRename(oldP, newP, st?.type ?? "file");
+      });
+      const origRemove = vault.remove.bind(vault);
+      const removeSpy = vi.spyOn(vault, "remove").mockImplementation(async (p) => {
+        await origRemove(p);
+        plugin.onVaultDelete(p);
+      });
+
+      // Remote creates a folder, renames OrigFolder -> RenamedFolder, renames BeforeRename.md -> AfterRename.md,
+      // and moves MovedOut.md outside the root folder
+      http.seedFolder("dir-new", "NewRemoteFolder", "root-folder-1");
+      http.renameOrMoveItem("dir-orig", { name: "RenamedFolder" });
+      http.renameOrMoveItem("f-rename", { name: "AfterRename.md" });
+      http.renameOrMoveItem("f-move-out", { parentId: "outside-root" });
+
+      http.driveRequests = [];
+      await plugin.pullDelta();
+
+      // Also simulate delayed async echo callbacks arriving 100ms after pullDelta within the 2s echo window
+      now += 100;
+      plugin.onVaultCreate("NewRemoteFolder", "folder");
+      plugin.onVaultRename("OrigFolder", "RenamedFolder", "folder");
+      plugin.onVaultRename("RenamedFolder/BeforeRename.md", "RenamedFolder/AfterRename.md", "file");
+      plugin.onVaultDelete("MovedOut.md");
+
+      mkdirSpy.mockRestore();
+      writeSpy.mockRestore();
+      renameSpy.mockRestore();
+      removeSpy.mockRestore();
+
+      // Advance past debounce timer: zero non-GET Drive requests should be made
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(http.driveRequests.filter((r) => r.method !== "GET")).toEqual([]);
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.pendingQueue?.upserts ?? []).toEqual([]);
+      expect(persisted.pendingQueue?.renames ?? []).toEqual([]);
+      expect(persisted.pendingQueue?.deletes ?? []).toEqual([]);
+    });
+  });
+
+  describe("Two-way deletions & delete-beats-edit", () => {
+    beforeEach(async () => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      plugin.dispose();
+      vi.useRealTimers();
+    });
+
+    it("moves a locally deleted file to Google Drive Trash (trashed: true) and removes it from Sync Index", async () => {
+      http.seedFile({
+        id: "drive-note-1",
+        name: "Note.md",
+        parentId: "root-folder-1",
+        content: "hello",
+        md5Checksum: "md5-note-1",
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      expect(await vault.exists("Note.md")).toBe(true);
+      now += 3_000;
+
+      await vault.remove("Note.md");
+      plugin.onVaultDelete("Note.md");
+
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(http.getItem("drive-note-1")?.trashed).toBe(true);
+      expect(http.findItemByName("Note.md", "root-folder-1")).toBeUndefined();
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.syncIndex["Note.md"]).toBeUndefined();
+    });
+
+    it("moves a locally deleted folder to Google Drive Trash (trashed: true) and removes the entire subtree from Sync Index", async () => {
+      http.seedFolder("dir-proj", "Projects", "root-folder-1");
+      http.seedFolder("dir-sub", "Sub", "dir-proj");
+      http.seedFile({ id: "f-todo", name: "Todo.md", parentId: "dir-proj", content: "todo" });
+      http.seedFile({ id: "f-plan", name: "Plan.md", parentId: "dir-sub", content: "plan" });
+
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      now += 3_000;
+
+      await vault.rmdir("Projects", true);
+      plugin.onVaultDelete("Projects/Sub/Plan.md");
+      plugin.onVaultDelete("Projects/Sub");
+      plugin.onVaultDelete("Projects/Todo.md");
+      plugin.onVaultDelete("Projects");
+
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(http.getItem("dir-proj")?.trashed).toBe(true);
+      expect(http.findItemByName("Projects", "root-folder-1")).toBeUndefined();
+
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.syncIndex["Projects"]).toBeUndefined();
+      expect(persisted.syncIndex["Projects/Sub"]).toBeUndefined();
+      expect(persisted.syncIndex["Projects/Sub/Plan.md"]).toBeUndefined();
+      expect(persisted.syncIndex["Projects/Todo.md"]).toBeUndefined();
+    });
+
+    it("hard-deletes local files and empty trashed parent folders on remote trash/remove without .trash/ and suppresses push echo loops", async () => {
+      http.seedFolder("dir-folder", "Folder", "root-folder-1");
+      http.seedFile({ id: "f-keep", name: "Keep.md", parentId: "dir-folder", content: "keep" });
+      http.seedFile({ id: "f-removed", name: "Removed.md", parentId: "dir-folder", content: "gone" });
+      http.seedFolder("dir-empty-parent", "TrashedParent", "root-folder-1");
+      http.seedFile({
+        id: "f-child",
+        name: "Child.md",
+        parentId: "dir-empty-parent",
+        content: "child",
+      });
+
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      now += 3_000;
+      http.driveRequests = [];
+
+      // Spy on vault.remove and vault.rmdir to simulate Obsidian firing vault.on("delete")
+      const origRemove = vault.remove.bind(vault);
+      const removeSpy = vi.spyOn(vault, "remove").mockImplementation(async (p) => {
+        await origRemove(p);
+        plugin.onVaultDelete(p);
+      });
+      const origRmdir = vault.rmdir.bind(vault);
+      const rmdirSpy = vi.spyOn(vault, "rmdir").mockImplementation(async (p, rec) => {
+        await origRmdir(p, rec);
+        plugin.onVaultDelete(`${p}/Child.md`);
+        plugin.onVaultDelete(p);
+      });
+
+      http.removeItem("f-removed");
+      http.trashItem("dir-empty-parent");
+
+      await plugin.pullDelta();
+      removeSpy.mockRestore();
+      rmdirSpy.mockRestore();
+
+      // Also simulate async Obsidian delete events firing right after pullDelta
+      plugin.onVaultDelete("Folder/Removed.md");
+      plugin.onVaultDelete("TrashedParent/Child.md");
+      plugin.onVaultDelete("TrashedParent");
+
+      await vi.advanceTimersByTimeAsync(1000);
+
+      expect(await vault.exists("Folder/Keep.md")).toBe(true);
+      expect(await vault.exists("Folder/Removed.md")).toBe(false);
+      expect(await vault.exists("TrashedParent/Child.md")).toBe(false);
+      expect(await vault.exists("TrashedParent")).toBe(false);
+      expect(await vault.exists(".trash")).toBe(false);
+
+      expect(plugin.isEchoSuppressed("Folder/Removed.md")).toBe(true);
+      expect(plugin.isEchoSuppressed("TrashedParent")).toBe(true);
+      expect(plugin.isEchoSuppressed("TrashedParent/Child.md")).toBe(true);
+
+      // Zero non-GET requests to Drive (no push echo loop)
+      expect(http.driveRequests.filter((r) => r.method !== "GET")).toEqual([]);
+
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.syncIndex["Folder/Keep.md"]).toBeDefined();
+      expect(persisted.syncIndex["Folder/Removed.md"]).toBeUndefined();
+      expect(persisted.syncIndex["TrashedParent"]).toBeUndefined();
+      expect(persisted.syncIndex["TrashedParent/Child.md"]).toBeUndefined();
+    });
+
+    it("delete beats edit (local delete vs remote edit): local delete wins regardless of pull/push order", async () => {
+      // Ordering A: pullDelta() runs before flushPendingPush()
+      http.seedFile({
+        id: "f-del-wins-a",
+        name: "LocalDeleteA.md",
+        parentId: "root-folder-1",
+        content: "v1",
+        md5Checksum: "md5-v1",
+      });
+      // Ordering B: flushPendingPush() runs before pullDelta()
+      http.seedFile({
+        id: "f-del-wins-b",
+        name: "LocalDeleteB.md",
+        parentId: "root-folder-1",
+        content: "v1",
+        md5Checksum: "md5-v1",
+      });
+
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      now += 3_000;
+
+      // Ordering A: iOS deletes LocalDeleteA.md, Mac edits it, pullDelta runs BEFORE 500ms push
+      await vault.remove("LocalDeleteA.md");
+      plugin.onVaultDelete("LocalDeleteA.md");
+      http.updateFileContent("f-del-wins-a", "mac edit v2", "md5-v2");
+
+      await plugin.pullDelta();
+      // Must remain deleted locally and not be resurrected by Mac's edit
+      expect(await vault.exists("LocalDeleteA.md")).toBe(false);
+
+      // Now flush the pending local delete
+      await vi.advanceTimersByTimeAsync(500);
+      expect(await vault.exists("LocalDeleteA.md")).toBe(false);
+      expect(http.getItem("f-del-wins-a")?.trashed).toBe(true);
+
+      // Ordering B: iOS deletes LocalDeleteB.md, Mac edits it, push flushes FIRST, then pullDelta runs
+      await vault.remove("LocalDeleteB.md");
+      plugin.onVaultDelete("LocalDeleteB.md");
+      http.updateFileContent("f-del-wins-b", "mac edit v2", "md5-v2");
+
+      await vi.advanceTimersByTimeAsync(500);
+      await plugin.pullDelta();
+
+      expect(await vault.exists("LocalDeleteB.md")).toBe(false);
+      expect(http.getItem("f-del-wins-b")?.trashed).toBe(true);
+
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.syncIndex["LocalDeleteA.md"]).toBeUndefined();
+      expect(persisted.syncIndex["LocalDeleteB.md"]).toBeUndefined();
+    });
+
+    it("delete beats edit (remote delete vs local edit): remote delete hard-deletes local copy regardless of pull/push order", async () => {
+      // Ordering A: pullDelta() runs before flushPendingPush()
+      http.seedFile({
+        id: "f-rdel-a",
+        name: "RemoteDeleteA.md",
+        parentId: "root-folder-1",
+        content: "v1",
+        md5Checksum: "md5-v1",
+      });
+      // Ordering B: flushPendingPush() runs before pullDelta()
+      http.seedFile({
+        id: "f-rdel-b",
+        name: "RemoteDeleteB.md",
+        parentId: "root-folder-1",
+        content: "v1",
+        md5Checksum: "md5-v1",
+      });
+
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+      now += 3_000;
+
+      // Ordering A: Mac trashes RemoteDeleteA.md, iOS edits it locally, pullDelta runs first
+      http.trashItem("f-rdel-a");
+      await vault.writeBinary("RemoteDeleteA.md", new TextEncoder().encode("ios edit").buffer);
+      plugin.onVaultModify("RemoteDeleteA.md");
+
+      await plugin.pullDelta();
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(await vault.exists("RemoteDeleteA.md")).toBe(false);
+      expect(http.getItem("f-rdel-a")?.trashed).toBe(true);
+
+      // Ordering B: Mac trashes RemoteDeleteB.md, iOS edits it locally, push flushes BEFORE pullDelta
+      http.trashItem("f-rdel-b");
+      await vault.writeBinary("RemoteDeleteB.md", new TextEncoder().encode("ios edit").buffer);
+      plugin.onVaultModify("RemoteDeleteB.md");
+
+      await vi.advanceTimersByTimeAsync(500);
+      await plugin.pullDelta();
+
+      expect(await vault.exists("RemoteDeleteB.md")).toBe(false);
+      expect(http.getItem("f-rdel-b")?.trashed).toBe(true);
+      expect(notices.notices).toEqual([]);
+
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.syncIndex["RemoteDeleteA.md"]).toBeUndefined();
+      expect(persisted.syncIndex["RemoteDeleteB.md"]).toBeUndefined();
+    });
+  });
+
+  describe("Edit-vs-edit conflict resolution", () => {
+    it("keeps local version at original path when local is newer, saves remote as conflict copy, syncs both, and emits Notice", async () => {
+      http.seedFile({
+        id: "file-1",
+        name: "Note.md",
+        parentId: "root-folder-1",
+        content: "baseline",
+        modifiedTime: new Date(now).toISOString(),
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+
+      // Remote edits Note.md at now + 10s
+      now += 10_000;
+      http.seedFile({
+        id: "file-1",
+        name: "Note.md",
+        parentId: "root-folder-1",
+        content: "remote edit",
+        md5Checksum: "md5-remote-v2",
+        modifiedTime: new Date(now).toISOString(),
+      });
+
+      // Local edits Note.md later at now + 50s (newer!)
+      now += 50_000;
+      await vault.writeBinary("Note.md", new TextEncoder().encode("local edit newer").buffer);
+      plugin.onVaultModify("Note.md");
+
+      // Pull runs before push
+      await plugin.pullDelta();
+
+      // Local newer version stays at Note.md in both local vault and Drive
+      expect(vault.readTextSync("Note.md")).toBe("local edit newer");
+      const remoteCanonical = http.findItemByName("Note.md", "root-folder-1");
+      expect(new TextDecoder().decode(remoteCanonical?.content)).toBe("local edit newer");
+
+      // Older remote version saved as conflict copy in both local vault and Drive
+      const expectedConflictName = "Note (conflict 2023-11-14 22-14).md";
+      expect(vault.readTextSync(expectedConflictName)).toBe("remote edit");
+      const remoteConflict = http.findItemByName(expectedConflictName, "root-folder-1");
+      expect(remoteConflict).toBeDefined();
+      expect(new TextDecoder().decode(remoteConflict?.content)).toBe("remote edit");
+
+      // Both tracked in Sync Index
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.syncIndex["Note.md"]).toBeDefined();
+      expect(persisted.syncIndex[expectedConflictName]).toBeDefined();
+      expect(persisted.syncIndex[expectedConflictName].driveId).toBe(remoteConflict?.id);
+
+      // Notice emitted naming the conflicted file
+      expect(notices.notices.some((m) => m.message.includes("Note.md"))).toBe(true);
+    });
+
+    it("keeps remote version at original path when remote is newer, saves local as conflict copy, syncs both, and emits Notice", async () => {
+      http.seedFile({
+        id: "file-1",
+        name: "Note.md",
+        parentId: "root-folder-1",
+        content: "baseline",
+        modifiedTime: new Date(now).toISOString(),
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+
+      // Local edits Note.md at now + 10s
+      now += 10_000;
+      await vault.writeBinary("Note.md", new TextEncoder().encode("local edit older").buffer);
+      plugin.onVaultModify("Note.md");
+
+      // Remote edits Note.md later at now + 50s (newer!)
+      now += 50_000;
+      http.seedFile({
+        id: "file-1",
+        name: "Note.md",
+        parentId: "root-folder-1",
+        content: "remote edit newer",
+        md5Checksum: "md5-remote-v2",
+        modifiedTime: new Date(now).toISOString(),
+      });
+
+      await plugin.pullDelta();
+
+      // Remote newer version stays at Note.md in both local vault and Drive
+      expect(vault.readTextSync("Note.md")).toBe("remote edit newer");
+      const remoteCanonical = http.findItemByName("Note.md", "root-folder-1");
+      expect(new TextDecoder().decode(remoteCanonical?.content)).toBe("remote edit newer");
+
+      // Older local version saved as conflict copy in both local vault and Drive
+      const expectedConflictName = "Note (conflict 2023-11-14 22-14).md";
+      expect(vault.readTextSync(expectedConflictName)).toBe("local edit older");
+      const remoteConflict = http.findItemByName(expectedConflictName, "root-folder-1");
+      expect(remoteConflict).toBeDefined();
+      expect(new TextDecoder().decode(remoteConflict?.content)).toBe("local edit older");
+
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.syncIndex["Note.md"]).toBeDefined();
+      expect(persisted.syncIndex[expectedConflictName]).toBeDefined();
+      expect(notices.notices.some((m) => m.message.includes("Note.md"))).toBe(true);
+    });
+
+    it("detects and resolves edit-vs-edit conflict during local push before pullDelta runs", async () => {
+      http.seedFile({
+        id: "file-1",
+        name: "PushFirst.md",
+        parentId: "root-folder-1",
+        content: "baseline",
+        modifiedTime: new Date(now).toISOString(),
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+
+      // Remote edits PushFirst.md at now + 10s
+      now += 10_000;
+      http.seedFile({
+        id: "file-1",
+        name: "PushFirst.md",
+        parentId: "root-folder-1",
+        content: "remote edit",
+        md5Checksum: "md5-remote-v2",
+        modifiedTime: new Date(now).toISOString(),
+      });
+
+      // Local edits PushFirst.md later at now + 50s and triggers syncNow() before pullDelta()
+      now += 50_000;
+      await vault.writeBinary("PushFirst.md", new TextEncoder().encode("local edit newer").buffer);
+      plugin.onVaultModify("PushFirst.md");
+      await plugin.syncNow();
+
+      expect(vault.readTextSync("PushFirst.md")).toBe("local edit newer");
+      const remoteCanonical = http.findItemByName("PushFirst.md", "root-folder-1");
+      expect(new TextDecoder().decode(remoteCanonical?.content)).toBe("local edit newer");
+
+      const expectedConflictName = "PushFirst (conflict 2023-11-14 22-14).md";
+      expect(vault.readTextSync(expectedConflictName)).toBe("remote edit");
+      const remoteConflict = http.findItemByName(expectedConflictName, "root-folder-1");
+      expect(remoteConflict).toBeDefined();
+      expect(new TextDecoder().decode(remoteConflict?.content)).toBe("remote edit");
+      expect(notices.notices.some((m) => m.message.includes("PushFirst.md"))).toBe(true);
+    });
+
+    it("converges without creating a conflict copy when local and remote make identical concurrent edits", async () => {
+      http.seedFile({
+        id: "file-1",
+        name: "Same.md",
+        parentId: "root-folder-1",
+        content: "baseline",
+        modifiedTime: new Date(now).toISOString(),
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+
+      now += 10_000;
+      http.seedFile({
+        id: "file-1",
+        name: "Same.md",
+        parentId: "root-folder-1",
+        content: "identical new text",
+        md5Checksum: "md5-same-v2",
+        modifiedTime: new Date(now).toISOString(),
+      });
+
+      now += 20_000;
+      await vault.writeBinary("Same.md", new TextEncoder().encode("identical new text").buffer);
+      plugin.onVaultModify("Same.md");
+
+      await plugin.pullDelta();
+
+      expect(vault.readTextSync("Same.md")).toBe("identical new text");
+      const rootFiles = (await vault.list("")).files;
+      expect(rootFiles).toEqual(["Same.md"]);
+      expect(notices.notices.some((m) => /conflict/i.test(m.message))).toBe(false);
+    });
+
+    it("handles extensionless filenames cleanly when creating conflict copies", async () => {
+      http.seedFile({
+        id: "file-extless",
+        name: "README",
+        parentId: "root-folder-1",
+        content: "baseline",
+        modifiedTime: new Date(now).toISOString(),
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+
+      now += 10_000;
+      http.seedFile({
+        id: "file-extless",
+        name: "README",
+        parentId: "root-folder-1",
+        content: "remote readme",
+        md5Checksum: "md5-readme-v2",
+        modifiedTime: new Date(now).toISOString(),
+      });
+
+      now += 50_000;
+      await vault.writeBinary("README", new TextEncoder().encode("local readme").buffer);
+      plugin.onVaultModify("README");
+
+      await plugin.pullDelta();
+
+      expect(vault.readTextSync("README")).toBe("local readme");
+      const expectedConflictName = "README (conflict 2023-11-14 22-14)";
+      expect(vault.readTextSync(expectedConflictName)).toBe("remote readme");
+      expect(http.findItemByName(expectedConflictName, "root-folder-1")).toBeDefined();
+    });
+
+    it("appends a disambiguating suffix if the conflict filename already exists", async () => {
+      http.seedFile({
+        id: "file-1",
+        name: "Note.md",
+        parentId: "root-folder-1",
+        content: "baseline",
+        modifiedTime: new Date(now).toISOString(),
+      });
+      // Pre-existing conflict file at the exact same timestamp
+      const firstConflictName = "Note (conflict 2023-11-14 22-14).md";
+      http.seedFile({
+        id: "file-existing-conflict",
+        name: firstConflictName,
+        parentId: "root-folder-1",
+        content: "earlier conflict",
+        modifiedTime: new Date(now).toISOString(),
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+
+      now += 10_000;
+      http.seedFile({
+        id: "file-1",
+        name: "Note.md",
+        parentId: "root-folder-1",
+        content: "remote v2",
+        md5Checksum: "md5-remote-v2",
+        modifiedTime: new Date(now).toISOString(),
+      });
+
+      now += 50_000;
+      await vault.writeBinary("Note.md", new TextEncoder().encode("local v2").buffer);
+      plugin.onVaultModify("Note.md");
+
+      await plugin.pullDelta();
+
+      const disambiguatedConflictName = "Note (conflict 2023-11-14 22-14) (2).md";
+      expect(vault.readTextSync(firstConflictName)).toBe("earlier conflict");
+      expect(vault.readTextSync(disambiguatedConflictName)).toBe("remote v2");
+      expect(http.findItemByName(disambiguatedConflictName, "root-folder-1")).toBeDefined();
+      const persisted = (await vault.loadPluginData()) as PluginData;
+      expect(persisted.syncIndex[disambiguatedConflictName]).toBeDefined();
+    });
+
+    it("resolves conflicts on binary attachments byte-for-byte", async () => {
+      const baselineBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x00]);
+      const remoteBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x01, 0x02]);
+      const localBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x03, 0x04, 0x05]);
+
+      http.seedFolder("folder-assets", "assets", "root-folder-1");
+      http.seedFile({
+        id: "img-1",
+        name: "diagram.png",
+        parentId: "folder-assets",
+        mimeType: "image/png",
+        content: baselineBytes,
+        modifiedTime: new Date(now).toISOString(),
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+
+      // Remote edits diagram.png later (newer!)
+      now += 60_000;
+      http.seedFile({
+        id: "img-1",
+        name: "diagram.png",
+        parentId: "folder-assets",
+        mimeType: "image/png",
+        content: remoteBytes,
+        md5Checksum: "md5-img-remote",
+        modifiedTime: new Date(now).toISOString(),
+      });
+
+      // Local edited diagram.png earlier (older)
+      now -= 30_000;
+      await vault.writeBinary("assets/diagram.png", localBytes.slice().buffer);
+      plugin.onVaultModify("assets/diagram.png");
+
+      // Advance clock for conflict timestamp
+      now += 30_000;
+      await plugin.pullDelta();
+
+      const localCanonical = new Uint8Array(await vault.readBinary("assets/diagram.png"));
+      expect(localCanonical).toEqual(remoteBytes);
+
+      const conflictPath = "assets/diagram (conflict 2023-11-14 22-14).png";
+      const localConflict = new Uint8Array(await vault.readBinary(conflictPath));
+      expect(localConflict).toEqual(localBytes);
+
+      const remoteConflict = http.findItemByName("diagram (conflict 2023-11-14 22-14).png", "folder-assets");
+      expect(remoteConflict?.content).toEqual(localBytes);
+      expect(notices.notices.some((m) => m.message.includes("assets/diagram.png"))).toBe(true);
+    });
+
+    it("computes standard RFC 1321 MD5 checksums and preserves unchanged-local vs edit-conflict detection across app restarts", async () => {
+      const { computeMd5Hex, computeContentHash } = await import("../src/conflict");
+      expect(computeMd5Hex(new TextEncoder().encode("").buffer)).toBe(
+        "d41d8cd98f00b204e9800998ecf8427e",
+      );
+      expect(computeMd5Hex(new TextEncoder().encode("abc").buffer)).toBe(
+        "900150983cd24fb0d6963f7d28e17f72",
+      );
+      expect(
+        computeContentHash(
+          new TextEncoder().encode(
+            "12345678901234567890123456789012345678901234567890123456789012345678901234567890",
+          ).buffer,
+        ),
+      ).toBe("57edf4a22be3c955ac49da2e2107b67a");
+
+      http.seedFile({
+        id: "f-unchanged",
+        name: "UnchangedAfterRestart.md",
+        parentId: "root-folder-1",
+        content: "baseline content",
+        modifiedTime: new Date(now).toISOString(),
+      });
+      http.seedFile({
+        id: "f-conflict",
+        name: "ConflictAfterRestart.md",
+        parentId: "root-folder-1",
+        content: "baseline content",
+        modifiedTime: new Date(now).toISOString(),
+      });
+      await plugin.importConfigBundle(JSON.stringify(makeBundle()));
+
+      // Simulate app restart so in-memory baselineHashes map is empty and only persisted syncIndex.md5Checksum exists
+      plugin.unload();
+      const restarted = new SyncPluginCore({
+        vault,
+        http,
+        notice: notices,
+        clock: { now: () => now },
+      });
+      await restarted.load();
+
+      // 1. Remote updates both files
+      now += 10_000;
+      http.updateFileContent("f-unchanged", "remote updated content");
+      http.updateFileContent("f-conflict", "remote conflicting content");
+
+      // 2. Local touches UnchangedAfterRestart.md without changing bytes (mtime advances),
+      //    and genuinely modifies ConflictAfterRestart.md
+      now += 20_000;
+      await vault.writeBinary(
+        "UnchangedAfterRestart.md",
+        new TextEncoder().encode("baseline content").buffer,
+      );
+      await vault.writeBinary(
+        "ConflictAfterRestart.md",
+        new TextEncoder().encode("local conflicting content").buffer,
+      );
+      restarted.onVaultModify("ConflictAfterRestart.md");
+
+      await restarted.pullDelta();
+
+      // UnchangedAfterRestart.md should fast-forward to remote without a conflict copy
+      expect(vault.readTextSync("UnchangedAfterRestart.md")).toBe("remote updated content");
+      expect(
+        vault.listAllFilePaths().filter((p) => p.startsWith("UnchangedAfterRestart (conflict")),
+      ).toEqual([]);
+
+      // ConflictAfterRestart.md should create a conflict copy
+      expect(vault.readTextSync("ConflictAfterRestart.md")).toBe("local conflicting content");
+      const conflictCopies = vault
+        .listAllFilePaths()
+        .filter((p) => p.startsWith("ConflictAfterRestart (conflict"));
+      expect(conflictCopies).toHaveLength(1);
+      expect(vault.readTextSync(conflictCopies[0])).toBe("remote conflicting content");
+
+      restarted.unload();
+    });
+  });
+});
