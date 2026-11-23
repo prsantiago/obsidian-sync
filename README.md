@@ -11,87 +11,103 @@ Cross-platform (`isDesktopOnly: false`) Obsidian plugin that automatically syncs
 
 ---
 
-## One-Time Setup Guide
+## End-to-End Setup Guide (In Order)
 
-### 1. Create a Free Google Cloud OAuth "Desktop app" Client
+Follow these steps from top to bottom. If you are installing from an already-published public release, skip **Step 0** and start at **Step 1**.
 
-1. Open [Google Cloud Console](https://console.cloud.google.com/) and create a project (e.g., `obsidian-gdrive-sync`).
-2. Enable the **Google Drive API** (*APIs & Services → Library → Google Drive API → Enable*).
-3. Configure the **OAuth consent screen**:
-   - Choose **External** user type.
-   - Fill in the required app name and email fields, and add the `https://www.googleapis.com/auth/drive` scope (or `drive.file` if restricting, though full `drive` is needed to access existing folders like `gd-sb-chachin`).
-   - **Important — Switch Publishing Status to "In Production":** On the *Audience* / *OAuth consent screen* page, click **Publish App** so the status is **In Production** (free, no Google app verification needed for personal use). Leaving the app in *Testing* mode causes refresh tokens to expire every **7 days**.
-4. Create OAuth credentials:
-   - Go to *APIs & Services → Credentials → Create Credentials → OAuth client ID*.
+### Step 0: Repo & Release Prerequisites (Maintainers Only)
+
+BRAT installs plugins on iOS by downloading `main.js`, `manifest.json`, and `styles.css` from a **public GitHub Release**. Before installing on iOS:
+
+1. **Verify no secrets are tracked in git:**
+   - Confirm `.gitignore` excludes `.env`, `.env.*`, `oauth-credentials*.json`, `*client_secret*.json`, `*credentials*.json`, `*token*.json`, `config-bundle*.json`, `config-bundle*.txt`, `data.json`, `*.pem`, `*.key`, `main.js`, and `dist/`.
+   - Run `git status --ignored` and `git log --all --stat` to confirm no OAuth secrets, refresh tokens, or config bundles were ever committed.
+2. **Verify tests and build pass:**
+   ```bash
+   npm install
+   npm test
+   npm run build
+   ```
+3. **Merge to `main` and make the repo public:**
+   - Merge your feature branch into `main` and push (`git push origin main`).
+   - Switch `prsantiago/obsidian-sync` to **Public** on GitHub so BRAT can access it.
+4. **Publish the GitHub Release:**
+   - Ensure `manifest.json`, `package.json`, and `versions.json` have matching version numbers, then push a version tag:
+     ```bash
+     git tag 0.1.0
+     git push origin 0.1.0
+     ```
+   - Wait for `.github/workflows/release.yml` to finish and attach `main.js`, `manifest.json`, and `styles.css` to the release.
+
+---
+
+### Step 1: Create & Publish a Google Cloud OAuth "Desktop app" Client
+
+1. **Create a project:** Open [Google Cloud Console](https://console.cloud.google.com/) and create a project (e.g., `obsidian-gdrive-sync`).
+2. **Enable the Drive API:** Go to **APIs & Services → Library**, search for **Google Drive API**, and click **Enable**.
+3. **Configure the OAuth Consent Screen (Google Auth Platform):**
+   - **Branding** (*Google Auth Platform → Branding*): Click **Get started** if prompted, enter an App name (e.g., `obsidian-gdrive-sync`), User support email, and Developer contact email, then **Save**.
+   - **Data Access** (*Google Auth Platform → Data Access*): Click **Add or remove scopes**, add `https://www.googleapis.com/auth/drive` (needed to access existing folders like `gd-sb-chachin`), click **Update**, and **Save**.
+   - **Audience** (*Google Auth Platform → Audience*): Confirm User type is **External**, then under *Publishing status* click **Publish app** and confirm so the status changes from *Testing* to **In production**.
+     > **Why this matters:** Leaving the app in *Testing* causes `Error 403: access_denied` (unless you add test users) and expires refresh tokens every **7 days**. Personal "In production" apps do **not** require Google app verification.
+4. **Create OAuth Credentials:**
+   - Go to **APIs & Services → Credentials → Create Credentials → OAuth client ID**.
    - Select Application type: **Desktop app**.
    - Copy your **Client ID** and **Client Secret**.
 
-### 2. Run the Mac One-Time OAuth Setup CLI Helper
+---
 
-On your Mac, clone this repository, install dependencies, and run the setup helper:
+### Step 2: Install the Plugin on iOS via BRAT
 
-```bash
-npm install
-npm run setup -- --client-id "<YOUR_CLIENT_ID>" --client-secret "<YOUR_CLIENT_SECRET>" --folder-name "obsidian-sync-test"
-```
-
-> **Tip:** Omit `--folder-name` when ready to link your real vault—it defaults to `gd-sb-chachin`. You can also pass `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` via environment variables or enter them at the interactive prompt.
-
-What the helper does:
-1. Opens your browser to Google's OAuth consent screen using a local loopback redirect (`http://127.0.0.1:<port>/callback`).
-2. If Google shows an *"App isn't verified"* warning (expected for personal "In Production" apps), click **Advanced → Go to \<app\> (unsafe)** once to grant access.
-3. Exchanges the authorization code for an offline `refresh_token`.
-4. Resolves the exact Google Drive Folder ID for the target folder name.
-5. Prints a single JSON **Configuration Bundle** (and optional base64) to copy to your iPhone (e.g., via Universal Clipboard / AirDrop / Apple Notes). Never commit this bundle to git.
-
-### 3. Install & Auto-Update on iOS via BRAT
-
-Once `prsantiago/obsidian-sync` is public, install the plugin for free on iOS using **BRAT** (*Beta Reviewers Auto-update Tester*):
-
-1. In Obsidian on iOS, open **Settings → Community plugins → Browse**, install **BRAT**, and enable it.
+1. In Obsidian on iOS, open **Settings → Community plugins → Browse**, install **BRAT** (*Beta Reviewers Auto-update Tester*), and enable it.
 2. Open **Settings → BRAT → Add Beta plugin**.
 3. Enter `prsantiago/obsidian-sync` and tap **Add Plugin**.
 4. Enable **Google Drive Sync** under **Settings → Community plugins**.
 
-BRAT downloads `main.js`, `manifest.json`, and `styles.css` directly from GitHub Releases and checks for updates automatically.
+---
 
-### 4. Paste the Configuration Bundle in iOS Settings
+### Step 3: Test First with a Throwaway Drive Folder (`obsidian-sync-test`)
 
-1. In Obsidian on iOS, open **Settings → Google Drive Sync**.
-2. Paste the JSON (or base64) output from the Mac setup helper into **Configuration Bundle**.
-3. Tap **Connect & Initial Sync**.
-4. Verify the status card shows **Connected**, the expected **Linked Folder** name, and **Folder ID**.
+Before linking your real vault, verify end-to-end sync against a disposable folder:
+
+1. **Create a test folder in Google Drive:** Create `obsidian-sync-test` in Google Drive with 1–2 test markdown files and 1 image attachment.
+2. **Generate a test Configuration Bundle on your Mac:**
+   ```bash
+   npm run setup -- --client-id "<YOUR_CLIENT_ID>" --client-secret "<YOUR_CLIENT_SECRET>" --folder-name "obsidian-sync-test"
+   ```
+   > You can also pass `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` via environment variables or enter them at the interactive prompt.
+   - Your browser will open to Google's OAuth screen via a local loopback redirect (`http://127.0.0.1:<port>/callback`).
+   - If Google shows *"Google hasn't verified this app"* (expected for personal "In production" apps), click **Advanced → Go to obsidian-gdrive-sync (unsafe)** once to grant access.
+   - The CLI exchanges the code for an offline `refresh_token`, resolves the Drive folder ID, and prints a JSON **Configuration Bundle** (never commit this to git).
+3. **Connect a fresh local iOS vault ("On My iPhone"):**
+   - Send the JSON bundle to your iPhone (e.g., Universal Clipboard / AirDrop / Apple Notes).
+   - In Obsidian on iOS, open **Settings → Google Drive Sync**, paste the JSON into **Configuration Bundle**, and tap **Connect & Initial Sync**.
+   - Verify the status card shows **Connected**, `obsidian-sync-test`, and the expected **Folder ID**.
+4. **Run a quick smoke test:**
+   - [ ] Initial pull downloads both markdown and binary image files cleanly.
+   - [ ] Edit a note on iOS and immediately lock the screen / switch apps; confirm `visibilitychange` flushes the edit to Google Drive within seconds.
+   - [ ] Edit a note on Google Drive / macOS and wait ~30 s (or background/foreground Obsidian on iOS) to confirm automatic delta pull.
+   - [ ] Test a simultaneous offline edit on both sides to verify a conflict copy is created without data loss.
+   - [ ] Delete a test note on iOS and confirm it moves to **Google Drive Trash** (recoverable for 30 days).
 
 ---
 
-## Pre-Release Throwaway Drive Folder Checklist (iOS)
+### Step 4: Link Your Real Vault (`gd-sb-chachin`)
 
-Before linking your real `gd-sb-chachin` vault, verify end-to-end iOS behavior against a throwaway Google Drive folder (e.g., `obsidian-sync-test`):
+Once the throwaway folder test passes:
 
-1. [ ] Create an empty `obsidian-sync-test` folder in Google Drive with 1–2 test markdown files and 1 image attachment.
-2. [ ] Run `npm run setup -- --folder-name "obsidian-sync-test"` on Mac and paste the bundle into a fresh local iOS vault ("On My iPhone").
-3. [ ] Confirm initial pull downloads both markdown and binary image files cleanly via iOS `WKWebView` `requestUrl`.
-4. [ ] Edit a note on iOS and immediately lock the screen / switch apps; confirm `visibilitychange` flushes the edit to Google Drive within seconds.
-5. [ ] Edit a note on Google Drive / macOS and wait ~30 s (or background/foreground Obsidian on iOS) to confirm automatic delta pull.
-6. [ ] Test a simultaneous offline edit on both sides to verify a conflict copy is created without data loss.
-7. [ ] Delete a test note on iOS and confirm it moves to **Google Drive Trash** (recoverable for 30 days).
-8. [ ] Once verified, re-run `npm run setup` (defaulting to `gd-sb-chachin`) and use **Re-import Configuration Bundle** in iOS Settings against a fresh local vault for `gd-sb-chachin`.
+1. On your Mac, run the setup helper without `--folder-name` (it defaults to `gd-sb-chachin`):
+   ```bash
+   npm run setup -- --client-id "<YOUR_CLIENT_ID>" --client-secret "<YOUR_CLIENT_SECRET>"
+   ```
+2. In Obsidian on iOS (against a fresh local vault for `gd-sb-chachin`), open **Settings → Google Drive Sync**, use **Re-import Configuration Bundle**, and paste the new JSON bundle.
+3. Verify the status card shows **Connected** and your real `gd-sb-chachin` **Folder ID**.
 
 ---
 
-## Public-Repo Transition Security Checklist
-
-Before switching `prsantiago/obsidian-sync` from private to public for BRAT:
-
-- [ ] Verify `.gitignore` excludes `.env`, `.env.*`, `oauth-credentials*.json`, `*client_secret*.json`, `*credentials*.json`, `*token*.json`, `config-bundle*.json`, `config-bundle*.txt`, `data.json`, `*.pem`, `*.key`, `main.js`, and `dist/`.
-- [ ] Run `git status --ignored` and `git log --all --stat` to confirm no OAuth client secrets, refresh tokens, or config bundles were ever committed.
-- [ ] Confirm `npm test` and `npm run build` pass cleanly.
-
----
-
-## Releasing a New Version (Maintainers)
+## Releasing Future Versions (Maintainers)
 
 1. Update `version` in `manifest.json` and `package.json`, and add the matching `"<version>": "<minAppVersion>"` entry to `versions.json`.
 2. Commit and push to `main`.
-3. Tag and push the release (e.g., `git tag 0.1.0 && git push origin 0.1.0`).
-4. The `.github/workflows/release.yml` workflow runs tests, builds `main.js`, validates `manifest.json` / `versions.json` / `package.json` consistency, and publishes `main.js`, `manifest.json`, and `styles.css` as GitHub Release assets for BRAT.
+3. Tag and push the release (e.g., `git tag 0.2.0 && git push origin 0.2.0`).
+4. `.github/workflows/release.yml` runs typecheck, tests, and build, validates version consistency, and publishes `main.js`, `manifest.json`, and `styles.css` as GitHub Release assets for BRAT.
